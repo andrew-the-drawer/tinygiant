@@ -109,8 +109,7 @@ def run_analysis():
         # Reset state
         engine.reset_kv()
         engine.expert_cache.access_counts = {}
-        engine.expert_cache.hits = 0
-        engine.expert_cache.pinned_hits = 0
+        engine.expert_cache.reset_stats()
 
         # Run calibration (prefill + 20 decode tokens)
         engine.calibrate(tokens, n_tokens=20)

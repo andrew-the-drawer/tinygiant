@@ -34,11 +34,11 @@ _model_name = "tinygiant-qwen3-30b"
 
 
 def _init_tokenizer(model_path):
-    from llama_cpp import Llama
-    llm = Llama(model_path=model_path, n_ctx=32, n_gpu_layers=0,
-                vocab_only=True, verbose=False)
-    STOP_TOKENS.add(llm.token_eos())
-    return llm
+    from ._tokenizer import load_tokenizer
+    tok = load_tokenizer(model_path)
+    if tok.eos_id is not None:
+        STOP_TOKENS.add(tok.eos_id)
+    return tok
 
 
 def _format_chat(messages):
@@ -53,11 +53,11 @@ def _format_chat(messages):
 
 
 def _tokenize(text):
-    return _tokenizer.tokenize(text.encode(), add_bos=True)
+    return _tokenizer.encode(text)
 
 
 def _detokenize(token_ids):
-    return _tokenizer.detokenize(token_ids).decode("utf-8", errors="replace")
+    return _tokenizer.decode(token_ids)
 
 
 import re

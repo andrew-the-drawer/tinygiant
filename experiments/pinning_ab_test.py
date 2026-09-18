@@ -52,16 +52,15 @@ def detokenize(llm, tokens):
 def run_trial(engine, tokens, llm, n_tokens, label):
     """Run generation and return stats."""
     engine.reset_kv()
-    engine.expert_cache.hits = 0
-    engine.expert_cache.pinned_hits = 0
+    engine.expert_cache.reset_stats()
 
-    np.random.seed(42)
     t0 = time.perf_counter()
-    generated = engine.generate(tokens, n_tokens=n_tokens, temperature=0.7)
+    generated = engine.generate(tokens, n_tokens=n_tokens, temperature=0.7, seed=42)
     elapsed = time.perf_counter() - t0
 
     ec = engine.expert_cache
-    hit_rate = ec.pinned_hits / ec.hits if ec.hits > 0 else 0
+    st = ec.stats
+    hit_rate = st["pinned_hits"] / st["accesses"] if st["accesses"] > 0 else 0
     tok_s = n_tokens / elapsed if elapsed > 0 else 0
 
     text = detokenize(llm, generated)
@@ -70,8 +69,8 @@ def run_trial(engine, tokens, llm, n_tokens, label):
         "label": label,
         "tok_s": tok_s,
         "total_time": elapsed,
-        "hits": ec.hits,
-        "pinned_hits": ec.pinned_hits,
+        "hits": st["accesses"],
+        "pinned_hits": st["pinned_hits"],
         "hit_rate": hit_rate,
         "pinned_count": len(ec.pinned),
         "text": text,

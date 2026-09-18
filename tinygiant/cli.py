@@ -8,15 +8,13 @@ import numpy as np
 
 
 def _tokenize(model_path, text):
-    from llama_cpp import Llama
-    llm = Llama(model_path=model_path, n_ctx=32, n_gpu_layers=0,
-                vocab_only=True, verbose=False)
-    tokens = llm.tokenize(text.encode(), add_bos=True)
-    return tokens, llm
+    from ._tokenizer import load_tokenizer
+    tok = load_tokenizer(model_path)
+    return tok.encode(text), tok
 
 
-def _detokenize(llm, tokens):
-    return llm.detokenize(tokens).decode("utf-8", errors="replace")
+def _detokenize(tok, tokens):
+    return tok.decode(tokens)
 
 
 def cmd_generate():
