@@ -227,9 +227,29 @@ tinygiant/
 - [x] ARM NEON intrinsics (3.2x over scalar C, 5.5 tok/s)
 - [x] Q8 input quantization + vdotq_s32 (15.2x over scalar, 25.9 tok/s compute ceiling)
 - [x] Three-tier memory benchmark with Q8+vdot (2.6-25.9 tok/s across hit rates)
-- [ ] End-to-end inference with fused Q4 kernel (integrate into nws_e2e_inference.py)
+- [x] End-to-end inference with fused Q4 kernel (`tinygiant/engine.py`)
+- [x] Fine-grained thread pool, batched multi-row kernels, parallel demand reads (13 → 25-30 tok/s on M5 Max)
+- [x] Explicit cold-expert loader (`pread` + `F_NOCACHE`, bounded budget) so small-RAM machines can be emulated
+- [x] Multi-layer lookahead prefetch, cache-aware routing bias, self-speculative decoding, token-id prior — measured in [docs/prefetch-study.md](docs/prefetch-study.md)
+- [ ] gpt-oss-120b port (MXFP4 kernel, attention sinks, sliding window)
 - [ ] Multi-platform testing (Linux, Windows, different SSDs)
 - [ ] llama.cpp integration (CPU offload path with fused Q4×Q8)
+
+## Prefetch study (2026-09, M5 Max)
+
+Emulating a 100B model's pin budget on Qwen3-30B (16 of 128 experts pinned per layer ≈ a 16 GB Mac; 56 ≈ a 36 GB Mac),
+measured with the scanner-corrected metric in [docs/prefetch-study.md](docs/prefetch-study.md):
+
+| | 16 GB regime | 36 GB regime |
+|---|---:|---:|
+| baseline (parallel demand reads) | 14.6 tok/s | 24.1 tok/s |
+| + lookahead prefetch (J=2, +2 candidates) | 19.6 | 25.4 |
+| + cache-aware bias β=0.5 (no measurable ppl loss) | 15.0 | 28.1 |
+| both | **20.8** | 26.9 |
+
+Self-speculative decoding (draft with resident experts, verify as a batch) reaches 86-89% acceptance at 44% pinned but costs
+more draft compute than the I/O it hides; a token-id prior prefetch is too inaccurate to pay for its bandwidth. Both are
+implemented (`--spec`, `--token-prior` in `benchmarks/bench.py`) but off by default.
 
 ## Related Discussions
 

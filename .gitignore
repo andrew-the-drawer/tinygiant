@@ -15,3 +15,14 @@ dist/
 
 # Expert cache data
 *.bin
+.venv/
+
+# Experiment artifacts (derived; regenerate with experiments/collect_traces.py)
+experiments/traces/
+experiments/*.npz
+benchmarks/*.log
+benchmarks/results.jsonl
+
+# Working notes
+prompt.md
+opus-proposed.md
