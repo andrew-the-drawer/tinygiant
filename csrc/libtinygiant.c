@@ -11,13 +11,117 @@
  *   gcc -shared -fPIC -O3 -march=armv8.2-a+dotprod -o libtinygiant.so tools/libtinygiant.c
  */
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <sys/mman.h>
 #include <arm_neon.h>
 
 #define QK_K      256
 #define Q4K_BSIZE 144   /* 2(d) + 2(dmin) + 12(scales) + 128(qs) */
+#define Q6K_BSIZE 210   /* 128(ql) + 64(qh) + 16(scales) + 2(d) */
+
+/* ═══ Thread pool ═══ */
+
+typedef void (*tg_task_fn)(void *ctx, size_t i);
+
+/* Workers spin briefly before sleeping so that the ~200 dispatches per decoded
+ * token don't each pay a condvar wake-up. */
+#define POOL_SPIN_ITERS 200000
+
+static struct {
+    pthread_t *threads;
+    int n_workers;
+    pthread_mutex_t mu;
+    pthread_cond_t cv_job;
+    atomic_ulong generation;
+    atomic_int stop;
+    tg_task_fn fn;
+    void *ctx;
+    size_t n_items;
+    atomic_size_t next;
+    atomic_int remaining;
+} pool = { .mu = PTHREAD_MUTEX_INITIALIZER,
+           .cv_job = PTHREAD_COND_INITIALIZER };
+
+static inline void cpu_relax(void) {
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+static void pool_run_items(void) {
+    for (;;) {
+        size_t i = atomic_fetch_add(&pool.next, 1);
+        if (i >= pool.n_items) break;
+        pool.fn(pool.ctx, i);
+    }
+}
+
+static void *pool_worker(void *arg) {
+    (void)arg;
+    unsigned long seen = 0;
+    for (;;) {
+        int spins = 0;
+        while (atomic_load_explicit(&pool.generation, memory_order_acquire) == seen &&
+               !atomic_load(&pool.stop)) {
+            if (++spins < POOL_SPIN_ITERS) { cpu_relax(); continue; }
+            pthread_mutex_lock(&pool.mu);
+            while (atomic_load_explicit(&pool.generation, memory_order_acquire) == seen &&
+                   !atomic_load(&pool.stop))
+                pthread_cond_wait(&pool.cv_job, &pool.mu);
+            pthread_mutex_unlock(&pool.mu);
+        }
+        if (atomic_load(&pool.stop)) return NULL;
+        seen = atomic_load_explicit(&pool.generation, memory_order_acquire);
+
+        pool_run_items();
+        atomic_fetch_sub_explicit(&pool.remaining, 1, memory_order_release);
+    }
+}
+
+void tg_set_threads(int n) {
+    if (pool.n_workers > 0) {
+        pthread_mutex_lock(&pool.mu);
+        atomic_store(&pool.stop, 1);
+        pthread_cond_broadcast(&pool.cv_job);
+        pthread_mutex_unlock(&pool.mu);
+        for (int i = 0; i < pool.n_workers; i++) pthread_join(pool.threads[i], NULL);
+        free(pool.threads);
+        pool.threads = NULL;
+        pool.n_workers = 0;
+        atomic_store(&pool.stop, 0);
+    }
+    if (n <= 1) return;
+    pool.n_workers = n - 1;
+    pool.threads = malloc(sizeof(pthread_t) * pool.n_workers);
+    for (int i = 0; i < pool.n_workers; i++)
+        pthread_create(&pool.threads[i], NULL, pool_worker, NULL);
+}
+
+int tg_get_threads(void) { return pool.n_workers + 1; }
+
+static void tg_parallel_for(size_t n, tg_task_fn fn, void *ctx) {
+    if (pool.n_workers == 0 || n <= 1) {
+        for (size_t i = 0; i < n; i++) fn(ctx, i);
+        return;
+    }
+    pool.fn = fn;
+    pool.ctx = ctx;
+    pool.n_items = n;
+    atomic_store(&pool.next, 0);
+    atomic_store(&pool.remaining, pool.n_workers);
+    pthread_mutex_lock(&pool.mu);
+    atomic_fetch_add_explicit(&pool.generation, 1, memory_order_release);
+    pthread_cond_broadcast(&pool.cv_job);
+    pthread_mutex_unlock(&pool.mu);
+
+    pool_run_items();
+
+    while (atomic_load_explicit(&pool.remaining, memory_order_acquire) > 0) cpu_relax();
+}
 
 /* ═══ f16 → f32 conversion ═══ */
 
@@ -55,6 +159,7 @@ static inline void get_scale_min_k4(int j, const uint8_t *scales,
 typedef struct {
     float   scale;
     int32_t sum;
+    int32_t bsums[8];   /* sum of each 32-value sub-block */
     int8_t  qs[QK_K];
 } q8_block;
 
@@ -73,18 +178,23 @@ static void quantize_q8(const float *x, q8_block *out, int n_blocks) {
         float inv = amax > 0 ? 127.f / amax : 0;
         out[b].scale = sc;
 
-        int32x4_t vsum = vdupq_n_s32(0);
         float32x4_t vinv = vdupq_n_f32(inv);
-        for (int i = 0; i < QK_K; i += 4) {
-            float32x4_t v = vld1q_f32(xb + i);
-            float32x4_t scaled = vmulq_f32(v, vinv);
-            int32x4_t rounded = vcvtnq_s32_f32(scaled);
-            int16x4_t n16 = vmovn_s32(rounded);
-            int8x8_t n8 = vmovn_s16(vcombine_s16(n16, n16));
-            vst1_lane_s32((int32_t *)(out[b].qs + i), vreinterpret_s32_s8(n8), 0);
-            vsum = vaddq_s32(vsum, rounded);
+        int32_t total = 0;
+        for (int j = 0; j < 8; j++) {
+            int32x4_t vsum = vdupq_n_s32(0);
+            for (int i = j * 32; i < (j + 1) * 32; i += 4) {
+                float32x4_t v = vld1q_f32(xb + i);
+                float32x4_t scaled = vmulq_f32(v, vinv);
+                int32x4_t rounded = vcvtnq_s32_f32(scaled);
+                int16x4_t n16 = vmovn_s32(rounded);
+                int8x8_t n8 = vmovn_s16(vcombine_s16(n16, n16));
+                vst1_lane_s32((int32_t *)(out[b].qs + i), vreinterpret_s32_s8(n8), 0);
+                vsum = vaddq_s32(vsum, rounded);
+            }
+            out[b].bsums[j] = vaddvq_s32(vsum);
+            total += out[b].bsums[j];
         }
-        out[b].sum = vaddvq_s32(vsum);
+        out[b].sum = total;
     }
 }
 
@@ -104,7 +214,6 @@ static void quantize_q8(const float *x, q8_block *out, int n_blocks) {
 static float dot_q4k_q8(const uint8_t *q4, const q8_block *xq, int bpr) {
     float total = 0;
     const uint8x16_t m0f = vdupq_n_u8(0x0F);
-    const int8x16_t ones = vdupq_n_s8(1);
 
     for (int b = 0; b < bpr; b++) {
         const uint8_t *bl = q4 + b * Q4K_BSIZE;
@@ -116,6 +225,7 @@ static float dot_q4k_q8(const uint8_t *q4, const q8_block *xq, int bpr) {
         const uint8_t *scales = bl + 4;
         const uint8_t *qs = bl + 16;
         const int8_t *xqs = xq[b].qs;
+        const int32_t *bsums = xq[b].bsums;
         float sx = xq[b].scale;
 
         float block_sum = 0;
@@ -127,40 +237,24 @@ static float dot_q4k_q8(const uint8_t *q4, const q8_block *xq, int bpr) {
             get_scale_min_k4(2 * g + 1, scales, &sc_hi, &m_hi);
 
             const uint8_t *qs_g = qs + g * 32;
-            /* lo nibbles correspond to values at offset g*64 */
             const int8_t *xq_lo = xqs + g * 64;
-            /* hi nibbles correspond to values at offset g*64 + 32 */
             const int8_t *xq_hi = xqs + g * 64 + 32;
 
             int32x4_t idot_lo = vdupq_n_s32(0);
             int32x4_t idot_hi = vdupq_n_s32(0);
-            int32x4_t isum_lo = vdupq_n_s32(0);
-            int32x4_t isum_hi = vdupq_n_s32(0);
 
-            /* Process 32 bytes in two 16-byte chunks */
             for (int j = 0; j < 32; j += 16) {
                 uint8x16_t raw = vld1q_u8(qs_g + j);
                 int8x16_t lo = vreinterpretq_s8_u8(vandq_u8(raw, m0f));
                 int8x16_t hi = vreinterpretq_s8_u8(vshrq_n_u8(raw, 4));
-
-                int8x16_t x_lo = vld1q_s8(xq_lo + j);
-                int8x16_t x_hi = vld1q_s8(xq_hi + j);
-
-                idot_lo = vdotq_s32(idot_lo, lo, x_lo);
-                idot_hi = vdotq_s32(idot_hi, hi, x_hi);
-                isum_lo = vdotq_s32(isum_lo, x_lo, ones);
-                isum_hi = vdotq_s32(isum_hi, x_hi, ones);
+                idot_lo = vdotq_s32(idot_lo, lo, vld1q_s8(xq_lo + j));
+                idot_hi = vdotq_s32(idot_hi, hi, vld1q_s8(xq_hi + j));
             }
 
-            int32_t dot_lo = vaddvq_s32(idot_lo);
-            int32_t dot_hi = vaddvq_s32(idot_hi);
-            int32_t sum_lo = vaddvq_s32(isum_lo);
-            int32_t sum_hi = vaddvq_s32(isum_hi);
-
-            block_sum += d * (float)sc_lo * (float)dot_lo
-                       - dmin * (float)m_lo * (float)sum_lo;
-            block_sum += d * (float)sc_hi * (float)dot_hi
-                       - dmin * (float)m_hi * (float)sum_hi;
+            block_sum += d * (float)sc_lo * (float)vaddvq_s32(idot_lo)
+                       - dmin * (float)m_lo * (float)bsums[2 * g];
+            block_sum += d * (float)sc_hi * (float)vaddvq_s32(idot_hi)
+                       - dmin * (float)m_hi * (float)bsums[2 * g + 1];
         }
 
         total += sx * block_sum;
@@ -168,20 +262,105 @@ static float dot_q4k_q8(const uint8_t *q4, const q8_block *xq, int bpr) {
     return total;
 }
 
+/* Same as dot_q4k_q8 but one weight row against 4 input rows: the weight
+ * nibbles are decoded once and reused for all 4 rows. */
+static void dot_q4k_q8_x4(const uint8_t *q4, const q8_block *const xq[4],
+                          int bpr, float out[4]) {
+    float total0 = 0, total1 = 0, total2 = 0, total3 = 0;
+    const uint8x16_t m0f = vdupq_n_u8(0x0F);
+
+    for (int b = 0; b < bpr; b++) {
+        const uint8_t *bl = q4 + b * Q4K_BSIZE;
+        uint16_t dr, dmr;
+        memcpy(&dr, bl, 2);
+        memcpy(&dmr, bl + 2, 2);
+        float d    = f16_to_f32(dr);
+        float dmin = f16_to_f32(dmr);
+        const uint8_t *scales = bl + 4;
+        const uint8_t *qs = bl + 16;
+        const q8_block *x0 = &xq[0][b], *x1 = &xq[1][b], *x2 = &xq[2][b], *x3 = &xq[3][b];
+
+        float bs0 = 0, bs1 = 0, bs2 = 0, bs3 = 0;
+
+        for (int g = 0; g < 4; g++) {
+            uint8_t sc_lo, m_lo, sc_hi, m_hi;
+            get_scale_min_k4(2 * g,     scales, &sc_lo, &m_lo);
+            get_scale_min_k4(2 * g + 1, scales, &sc_hi, &m_hi);
+
+            const uint8_t *qs_g = qs + g * 32;
+            int off_lo = g * 64, off_hi = g * 64 + 32;
+
+            int32x4_t l0 = vdupq_n_s32(0), l1 = vdupq_n_s32(0), l2 = vdupq_n_s32(0), l3 = vdupq_n_s32(0);
+            int32x4_t h0 = vdupq_n_s32(0), h1 = vdupq_n_s32(0), h2 = vdupq_n_s32(0), h3 = vdupq_n_s32(0);
+
+            for (int j = 0; j < 32; j += 16) {
+                uint8x16_t raw = vld1q_u8(qs_g + j);
+                int8x16_t lo = vreinterpretq_s8_u8(vandq_u8(raw, m0f));
+                int8x16_t hi = vreinterpretq_s8_u8(vshrq_n_u8(raw, 4));
+                l0 = vdotq_s32(l0, lo, vld1q_s8(x0->qs + off_lo + j));
+                l1 = vdotq_s32(l1, lo, vld1q_s8(x1->qs + off_lo + j));
+                l2 = vdotq_s32(l2, lo, vld1q_s8(x2->qs + off_lo + j));
+                l3 = vdotq_s32(l3, lo, vld1q_s8(x3->qs + off_lo + j));
+                h0 = vdotq_s32(h0, hi, vld1q_s8(x0->qs + off_hi + j));
+                h1 = vdotq_s32(h1, hi, vld1q_s8(x1->qs + off_hi + j));
+                h2 = vdotq_s32(h2, hi, vld1q_s8(x2->qs + off_hi + j));
+                h3 = vdotq_s32(h3, hi, vld1q_s8(x3->qs + off_hi + j));
+            }
+
+            float dsl = d * (float)sc_lo, dml = dmin * (float)m_lo;
+            float dsh = d * (float)sc_hi, dmh = dmin * (float)m_hi;
+            bs0 += dsl * (float)vaddvq_s32(l0) - dml * (float)x0->bsums[2 * g]
+                 + dsh * (float)vaddvq_s32(h0) - dmh * (float)x0->bsums[2 * g + 1];
+            bs1 += dsl * (float)vaddvq_s32(l1) - dml * (float)x1->bsums[2 * g]
+                 + dsh * (float)vaddvq_s32(h1) - dmh * (float)x1->bsums[2 * g + 1];
+            bs2 += dsl * (float)vaddvq_s32(l2) - dml * (float)x2->bsums[2 * g]
+                 + dsh * (float)vaddvq_s32(h2) - dmh * (float)x2->bsums[2 * g + 1];
+            bs3 += dsl * (float)vaddvq_s32(l3) - dml * (float)x3->bsums[2 * g]
+                 + dsh * (float)vaddvq_s32(h3) - dmh * (float)x3->bsums[2 * g + 1];
+        }
+
+        total0 += x0->scale * bs0;
+        total1 += x1->scale * bs1;
+        total2 += x2->scale * bs2;
+        total3 += x3->scale * bs3;
+    }
+    out[0] = total0; out[1] = total1; out[2] = total2; out[3] = total3;
+}
+
 /* ═══ Matrix-vector multiply: Q4_K matrix × float vector ═══ */
+
+#define MM_CHUNK 64
+
+static float dot_q6k_q8(const uint8_t *q6, const q8_block *xq, int bpr);
+
+typedef struct {
+    const uint8_t *mat;
+    const q8_block *xq;
+    float *out;
+    int nrows, bpr;
+    int q6;
+} mm_ctx;
+
+static void mm_task(void *p, size_t i) {
+    mm_ctx *c = p;
+    int r0 = (int)(i * MM_CHUNK);
+    int r1 = r0 + MM_CHUNK < c->nrows ? r0 + MM_CHUNK : c->nrows;
+    if (c->q6) {
+        for (int r = r0; r < r1; r++)
+            c->out[r] = dot_q6k_q8(c->mat + (size_t)r * c->bpr * Q6K_BSIZE, c->xq, c->bpr);
+    } else {
+        for (int r = r0; r < r1; r++)
+            c->out[r] = dot_q4k_q8(c->mat + (size_t)r * c->bpr * Q4K_BSIZE, c->xq, c->bpr);
+    }
+}
 
 static void matmul_q4k(const uint8_t *q4_matrix, const float *input,
                         float *output, int nrows, int ncols) {
     int bpr = ncols / QK_K;
-    int n_q8 = bpr;
-
-    /* Quantize input to Q8 once */
     q8_block xq[bpr];
-    quantize_q8(input, xq, n_q8);
-
-    for (int r = 0; r < nrows; r++) {
-        output[r] = dot_q4k_q8(q4_matrix + (size_t)r * bpr * Q4K_BSIZE, xq, bpr);
-    }
+    quantize_q8(input, xq, bpr);
+    mm_ctx c = { q4_matrix, xq, output, nrows, bpr, 0 };
+    tg_parallel_for((nrows + MM_CHUNK - 1) / MM_CHUNK, mm_task, &c);
 }
 
 void tg_matmul_q4k(const uint8_t *q4_matrix, const float *input,
@@ -191,7 +370,26 @@ void tg_matmul_q4k(const uint8_t *q4_matrix, const float *input,
 
 /* ═══ Q6_K × Q8 fused kernel ═══ */
 
-#define Q6K_BSIZE 210   /* 128(ql) + 64(qh) + 16(scales) + 2(d) */
+/* Decode 16 bytes of a Q6_K half-block at offset l into the four 16-lane
+ * signed vectors that pair with input offsets l, l+32, l+64, l+96. */
+static inline void unpack_q6k_16(const uint8_t *ql_h, const uint8_t *qh_h, int l,
+                                 int8x16_t *v1, int8x16_t *v2,
+                                 int8x16_t *v3, int8x16_t *v4) {
+    const uint8x16_t m0f = vdupq_n_u8(0x0F);
+    const uint8x16_t m03 = vdupq_n_u8(0x03);
+    const int8x16_t off = vdupq_n_s8(32);
+    uint8x16_t q0 = vld1q_u8(ql_h + l);
+    uint8x16_t q1 = vld1q_u8(ql_h + l + 32);
+    uint8x16_t h  = vld1q_u8(qh_h + l);
+    uint8x16_t b1 = vorrq_u8(vandq_u8(q0, m0f), vshlq_n_u8(vandq_u8(h, m03), 4));
+    uint8x16_t b2 = vorrq_u8(vandq_u8(q1, m0f), vshlq_n_u8(vandq_u8(vshrq_n_u8(h, 2), m03), 4));
+    uint8x16_t b3 = vorrq_u8(vshrq_n_u8(q0, 4),  vshlq_n_u8(vandq_u8(vshrq_n_u8(h, 4), m03), 4));
+    uint8x16_t b4 = vorrq_u8(vshrq_n_u8(q1, 4),  vshlq_n_u8(vshrq_n_u8(h, 6), 4));
+    *v1 = vsubq_s8(vreinterpretq_s8_u8(b1), off);
+    *v2 = vsubq_s8(vreinterpretq_s8_u8(b2), off);
+    *v3 = vsubq_s8(vreinterpretq_s8_u8(b3), off);
+    *v4 = vsubq_s8(vreinterpretq_s8_u8(b4), off);
+}
 
 static float dot_q6k_q8(const uint8_t *q6, const q8_block *xq, int bpr) {
     float total = 0;
@@ -216,35 +414,13 @@ static float dot_q6k_q8(const uint8_t *q6, const q8_block *xq, int bpr) {
 
             for (int l = 0; l < 32; l += 16) {
                 int is_base = l / 16;
+                int8x16_t vv1, vv2, vv3, vv4;
+                unpack_q6k_16(ql_h, qh_h, l, &vv1, &vv2, &vv3, &vv4);
 
-                int8_t v1[16], v2[16], v3[16], v4[16];
-                for (int k = 0; k < 16; k++) {
-                    int j = l + k;
-                    uint8_t lo4_0 = ql_h[j] & 0xF;
-                    uint8_t lo4_1 = ql_h[j + 32] & 0xF;
-                    uint8_t hi4_0 = ql_h[j] >> 4;
-                    uint8_t hi4_1 = ql_h[j + 32] >> 4;
-                    uint8_t qh_byte = qh_h[j];
-                    v1[k] = (int8_t)((lo4_0 | (((qh_byte >> 0) & 3) << 4)) - 32);
-                    v2[k] = (int8_t)((lo4_1 | (((qh_byte >> 2) & 3) << 4)) - 32);
-                    v3[k] = (int8_t)((hi4_0 | (((qh_byte >> 4) & 3) << 4)) - 32);
-                    v4[k] = (int8_t)((hi4_1 | (((qh_byte >> 6) & 3) << 4)) - 32);
-                }
-
-                int8x16_t vv1 = vld1q_s8(v1);
-                int8x16_t vv2 = vld1q_s8(v2);
-                int8x16_t vv3 = vld1q_s8(v3);
-                int8x16_t vv4 = vld1q_s8(v4);
-
-                int8x16_t x1 = vld1q_s8(xq_h + l);
-                int8x16_t x2 = vld1q_s8(xq_h + l + 32);
-                int8x16_t x3 = vld1q_s8(xq_h + l + 64);
-                int8x16_t x4 = vld1q_s8(xq_h + l + 96);
-
-                int32x4_t d1 = vdotq_s32(vdupq_n_s32(0), vv1, x1);
-                int32x4_t d2 = vdotq_s32(vdupq_n_s32(0), vv2, x2);
-                int32x4_t d3 = vdotq_s32(vdupq_n_s32(0), vv3, x3);
-                int32x4_t d4 = vdotq_s32(vdupq_n_s32(0), vv4, x4);
+                int32x4_t d1 = vdotq_s32(vdupq_n_s32(0), vv1, vld1q_s8(xq_h + l));
+                int32x4_t d2 = vdotq_s32(vdupq_n_s32(0), vv2, vld1q_s8(xq_h + l + 32));
+                int32x4_t d3 = vdotq_s32(vdupq_n_s32(0), vv3, vld1q_s8(xq_h + l + 64));
+                int32x4_t d4 = vdotq_s32(vdupq_n_s32(0), vv4, vld1q_s8(xq_h + l + 96));
 
                 block_sum += (float)sc_h[is_base + 0] * (float)vaddvq_s32(d1);
                 block_sum += (float)sc_h[is_base + 2] * (float)vaddvq_s32(d2);
@@ -257,14 +433,57 @@ static float dot_q6k_q8(const uint8_t *q6, const q8_block *xq, int bpr) {
     return total;
 }
 
+static void dot_q6k_q8_x4(const uint8_t *q6, const q8_block *const xq[4],
+                          int bpr, float out[4]) {
+    float total[4] = {0, 0, 0, 0};
+    for (int b = 0; b < bpr; b++) {
+        const uint8_t *bl = q6 + b * Q6K_BSIZE;
+        const uint8_t *ql = bl;
+        const uint8_t *qh = bl + 128;
+        const int8_t *sc = (const int8_t *)(bl + 192);
+        uint16_t dr;
+        memcpy(&dr, bl + 208, 2);
+        float d = f16_to_f32(dr);
+
+        float bs[4] = {0, 0, 0, 0};
+
+        for (int half = 0; half < 2; half++) {
+            const uint8_t *ql_h = ql + half * 64;
+            const uint8_t *qh_h = qh + half * 32;
+            const int8_t *sc_h = sc + half * 8;
+
+            for (int l = 0; l < 32; l += 16) {
+                int is_base = l / 16;
+                int8x16_t vv1, vv2, vv3, vv4;
+                unpack_q6k_16(ql_h, qh_h, l, &vv1, &vv2, &vv3, &vv4);
+                float s1 = (float)sc_h[is_base + 0], s2 = (float)sc_h[is_base + 2];
+                float s3 = (float)sc_h[is_base + 4], s4 = (float)sc_h[is_base + 6];
+
+                for (int r = 0; r < 4; r++) {
+                    const int8_t *xq_h = xq[r][b].qs + half * 128;
+                    int32x4_t d1 = vdotq_s32(vdupq_n_s32(0), vv1, vld1q_s8(xq_h + l));
+                    int32x4_t d2 = vdotq_s32(vdupq_n_s32(0), vv2, vld1q_s8(xq_h + l + 32));
+                    int32x4_t d3 = vdotq_s32(vdupq_n_s32(0), vv3, vld1q_s8(xq_h + l + 64));
+                    int32x4_t d4 = vdotq_s32(vdupq_n_s32(0), vv4, vld1q_s8(xq_h + l + 96));
+                    bs[r] += s1 * (float)vaddvq_s32(d1);
+                    bs[r] += s2 * (float)vaddvq_s32(d2);
+                    bs[r] += s3 * (float)vaddvq_s32(d3);
+                    bs[r] += s4 * (float)vaddvq_s32(d4);
+                }
+            }
+        }
+        for (int r = 0; r < 4; r++) total[r] += d * xq[r][b].scale * bs[r];
+    }
+    for (int r = 0; r < 4; r++) out[r] = total[r];
+}
+
 static void matmul_q6k(const uint8_t *q6_matrix, const float *input,
                         float *output, int nrows, int ncols) {
     int bpr = ncols / QK_K;
     q8_block xq[bpr];
     quantize_q8(input, xq, bpr);
-    for (int r = 0; r < nrows; r++) {
-        output[r] = dot_q6k_q8(q6_matrix + (size_t)r * bpr * Q6K_BSIZE, xq, bpr);
-    }
+    mm_ctx c = { q6_matrix, xq, output, nrows, bpr, 1 };
+    tg_parallel_for((nrows + MM_CHUNK - 1) / MM_CHUNK, mm_task, &c);
 }
 
 void tg_matmul_q6k(const uint8_t *q6_matrix, const float *input,
@@ -457,6 +676,86 @@ void tg_attention_decode(
 
 /* ═══ GQA Attention Decode Step (Q4_K weights) ═══ */
 
+typedef struct {
+    const uint8_t *wq, *wk;
+    const uint16_t *wv;
+    const q8_block *xq;
+    const float *input;
+    float *q, *k, *v;
+    int q_dim, kv_dim, embed_dim, bpr;
+    int n_q_chunks, n_k_chunks;
+} qkv_ctx;
+
+static void qkv_task(void *p, size_t i) {
+    qkv_ctx *c = p;
+    if ((int)i < c->n_q_chunks) {
+        int r0 = (int)i * MM_CHUNK, r1 = r0 + MM_CHUNK < c->q_dim ? r0 + MM_CHUNK : c->q_dim;
+        for (int r = r0; r < r1; r++)
+            c->q[r] = dot_q4k_q8(c->wq + (size_t)r * c->bpr * Q4K_BSIZE, c->xq, c->bpr);
+    } else if ((int)i < c->n_q_chunks + c->n_k_chunks) {
+        int r0 = ((int)i - c->n_q_chunks) * MM_CHUNK;
+        int r1 = r0 + MM_CHUNK < c->kv_dim ? r0 + MM_CHUNK : c->kv_dim;
+        for (int r = r0; r < r1; r++)
+            c->k[r] = dot_q4k_q8(c->wk + (size_t)r * c->bpr * Q4K_BSIZE, c->xq, c->bpr);
+    } else {
+        int r0 = ((int)i - c->n_q_chunks - c->n_k_chunks) * MM_CHUNK;
+        int r1 = r0 + MM_CHUNK < c->kv_dim ? r0 + MM_CHUNK : c->kv_dim;
+        matvec_f16(c->wv + (size_t)r0 * c->embed_dim, c->input, c->v + r0, r1 - r0, c->embed_dim);
+    }
+}
+
+typedef struct {
+    const float *q;
+    const float *kv_k, *kv_v;
+    float *out;
+    int seq_len, kv_max, head_dim, gqa_ratio;
+    float inv_sqrt;
+} head_ctx;
+
+static void head_task(void *p, size_t h) {
+    head_ctx *c = p;
+    int head_dim = c->head_dim, seq_len = c->seq_len;
+    int kv_h = (int)h / c->gqa_ratio;
+    const float *q_h = c->q + h * head_dim;
+    const float *k_cache = c->kv_k + (size_t)kv_h * c->kv_max * head_dim;
+    const float *v_cache = c->kv_v + (size_t)kv_h * c->kv_max * head_dim;
+
+    float scores[seq_len];
+    float max_score = -1e30f;
+    for (int t = 0; t < seq_len; t++) {
+        float32x4_t acc = vdupq_n_f32(0);
+        const float *kt = k_cache + (size_t)t * head_dim;
+        int d = 0;
+        for (; d + 3 < head_dim; d += 4)
+            acc = vfmaq_f32(acc, vld1q_f32(q_h + d), vld1q_f32(kt + d));
+        float dot = vaddvq_f32(acc);
+        for (; d < head_dim; d++) dot += q_h[d] * kt[d];
+        scores[t] = dot * c->inv_sqrt;
+        if (scores[t] > max_score) max_score = scores[t];
+    }
+    float sum_exp = 0;
+    for (int t = 0; t < seq_len; t++) {
+        scores[t] = expf(scores[t] - max_score);
+        sum_exp += scores[t];
+    }
+    float inv_sum = 1.f / sum_exp;
+
+    float *out_h = c->out + h * head_dim;
+    memset(out_h, 0, head_dim * sizeof(float));
+    for (int t = 0; t < seq_len; t++) {
+        float w = scores[t] * inv_sum;
+        const float *vt = v_cache + (size_t)t * head_dim;
+        float32x4_t vw = vdupq_n_f32(w);
+        int d = 0;
+        for (; d + 3 < head_dim; d += 4) {
+            float32x4_t cur = vld1q_f32(out_h + d);
+            cur = vfmaq_f32(cur, vw, vld1q_f32(vt + d));
+            vst1q_f32(out_h + d, cur);
+        }
+        for (; d < head_dim; d++) out_h[d] += w * vt[d];
+    }
+}
+
 void tg_attention_decode_q4(
     const uint8_t *wq_q4, const uint8_t *wk_q4,
     const uint16_t *wv_f16, const uint8_t *wo_q4,
@@ -469,15 +768,16 @@ void tg_attention_decode_q4(
     int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
     int gqa_ratio = n_heads / n_kv_heads;
+    int bpr = embed_dim / QK_K;
 
     float q[q_dim], k[kv_dim], v[kv_dim];
 
-    /* Q/K projections via fused Q4×Q8 kernel */
-    matmul_q4k(wq_q4, input, q, q_dim, embed_dim);
-    matmul_q4k(wk_q4, input, k, kv_dim, embed_dim);
-
-    /* V projection via f16 matvec */
-    matvec_f16(wv_f16, input, v, kv_dim, embed_dim);
+    /* Q/K/V projections in one dispatch (shared Q8 input) */
+    q8_block xq[bpr];
+    quantize_q8(input, xq, bpr);
+    qkv_ctx qc = { wq_q4, wk_q4, wv_f16, xq, input, q, k, v, q_dim, kv_dim, embed_dim, bpr,
+                   (q_dim + MM_CHUNK - 1) / MM_CHUNK, (kv_dim + MM_CHUNK - 1) / MM_CHUNK };
+    tg_parallel_for((size_t)qc.n_q_chunks + 2 * qc.n_k_chunks, qkv_task, &qc);
 
     /* QK norms */
     float q_normed[q_dim], k_normed[kv_dim];
@@ -498,53 +798,11 @@ void tg_attention_decode_q4(
                v + h * head_dim, head_dim * sizeof(float));
     }
 
-    /* GQA attention */
+    /* GQA attention, one task per head */
     float attn_out[q_dim];
-    int seq_len = kv_len + 1;
-    float inv_sqrt = 1.f / sqrtf((float)head_dim);
-
-    for (int h = 0; h < n_heads; h++) {
-        int kv_h = h / gqa_ratio;
-        const float *q_h = q_normed + h * head_dim;
-        const float *k_cache = kv_k + (size_t)kv_h * kv_max * head_dim;
-        const float *v_cache = kv_v + (size_t)kv_h * kv_max * head_dim;
-
-        float scores[seq_len];
-        float max_score = -1e30f;
-        for (int t = 0; t < seq_len; t++) {
-            float32x4_t acc = vdupq_n_f32(0);
-            const float *kt = k_cache + t * head_dim;
-            int d = 0;
-            for (; d + 3 < head_dim; d += 4)
-                acc = vfmaq_f32(acc, vld1q_f32(q_h + d), vld1q_f32(kt + d));
-            float dot = vaddvq_f32(acc);
-            for (; d < head_dim; d++) dot += q_h[d] * kt[d];
-            scores[t] = dot * inv_sqrt;
-            if (scores[t] > max_score) max_score = scores[t];
-        }
-
-        float sum_exp = 0;
-        for (int t = 0; t < seq_len; t++) {
-            scores[t] = expf(scores[t] - max_score);
-            sum_exp += scores[t];
-        }
-        float inv_sum = 1.f / sum_exp;
-
-        float *out_h = attn_out + h * head_dim;
-        memset(out_h, 0, head_dim * sizeof(float));
-        for (int t = 0; t < seq_len; t++) {
-            float w = scores[t] * inv_sum;
-            const float *vt = v_cache + t * head_dim;
-            float32x4_t vw = vdupq_n_f32(w);
-            int d = 0;
-            for (; d + 3 < head_dim; d += 4) {
-                float32x4_t cur = vld1q_f32(out_h + d);
-                cur = vfmaq_f32(cur, vw, vld1q_f32(vt + d));
-                vst1q_f32(out_h + d, cur);
-            }
-            for (; d < head_dim; d++) out_h[d] += w * vt[d];
-        }
-    }
+    head_ctx hc = { q_normed, kv_k, kv_v, attn_out, kv_len + 1, kv_max, head_dim, gqa_ratio,
+                    1.f / sqrtf((float)head_dim) };
+    tg_parallel_for(n_heads, head_task, &hc);
 
     /* Output projection via fused Q4×Q8 */
     matmul_q4k(wo_q4, attn_out, output, embed_dim, q_dim);
@@ -640,6 +898,289 @@ void tg_expert_forward_mixed(
 
     for (int i = 0; i < embed_dim; i++)
         output[i] += weight * down_out[i];
+}
+
+/* ═══ Multi-row expert forward ═══
+ *
+ * inputs: [k][embed_dim], output: [k][embed_dim] (accumulated, += weight[r] * expert(x_r)).
+ * Rows are processed in groups of 4 so each weight block is decoded once per group.
+ */
+
+static void q4k_rows(const uint8_t *mat, int nrows, int bpr,
+                     const q8_block *xq, int k, int xq_stride,
+                     float *out, int out_stride) {
+    if (k == 1) {
+        for (int row = 0; row < nrows; row++)
+            out[row] = dot_q4k_q8(mat + (size_t)row * bpr * Q4K_BSIZE, xq, bpr);
+        return;
+    }
+    for (int r0 = 0; r0 < k; r0 += 4) {
+        const q8_block *p[4];
+        for (int r = 0; r < 4; r++) {
+            int rr = r0 + r < k ? r0 + r : k - 1;
+            p[r] = xq + (size_t)rr * xq_stride;
+        }
+        int n = k - r0 < 4 ? k - r0 : 4;
+        for (int row = 0; row < nrows; row++) {
+            float o[4];
+            dot_q4k_q8_x4(mat + (size_t)row * bpr * Q4K_BSIZE, p, bpr, o);
+            for (int r = 0; r < n; r++) out[(size_t)(r0 + r) * out_stride + row] = o[r];
+        }
+    }
+}
+
+static void q6k_rows(const uint8_t *mat, int nrows, int bpr,
+                     const q8_block *xq, int k, int xq_stride,
+                     float *out, int out_stride) {
+    if (k == 1) {
+        for (int row = 0; row < nrows; row++)
+            out[row] = dot_q6k_q8(mat + (size_t)row * bpr * Q6K_BSIZE, xq, bpr);
+        return;
+    }
+    for (int r0 = 0; r0 < k; r0 += 4) {
+        const q8_block *p[4];
+        for (int r = 0; r < 4; r++) {
+            int rr = r0 + r < k ? r0 + r : k - 1;
+            p[r] = xq + (size_t)rr * xq_stride;
+        }
+        int n = k - r0 < 4 ? k - r0 : 4;
+        for (int row = 0; row < nrows; row++) {
+            float o[4];
+            dot_q6k_q8_x4(mat + (size_t)row * bpr * Q6K_BSIZE, p, bpr, o);
+            for (int r = 0; r < n; r++) out[(size_t)(r0 + r) * out_stride + row] = o[r];
+        }
+    }
+}
+
+void tg_expert_forward_rows(
+    const uint8_t *gate_q4, const uint8_t *up_q4,
+    const void *down_data, int down_format,
+    const float *inputs, float *output, const float *weights, int k,
+    int embed_dim, int inter_dim)
+{
+    int gate_bpr = embed_dim / QK_K;
+    int down_bpr = inter_dim / QK_K;
+
+    q8_block *xq_embed = malloc(sizeof(q8_block) * gate_bpr * k);
+    float *gate_out = malloc(sizeof(float) * inter_dim * k);
+    float *up_out   = malloc(sizeof(float) * inter_dim * k);
+    float *hidden   = gate_out;
+    float *down_out = malloc(sizeof(float) * embed_dim * k);
+
+    for (int r = 0; r < k; r++)
+        quantize_q8(inputs + (size_t)r * embed_dim, xq_embed + (size_t)r * gate_bpr, gate_bpr);
+
+    q4k_rows(gate_q4, inter_dim, gate_bpr, xq_embed, k, gate_bpr, gate_out, inter_dim);
+    q4k_rows(up_q4,   inter_dim, gate_bpr, xq_embed, k, gate_bpr, up_out,   inter_dim);
+
+    for (size_t i = 0; i < (size_t)inter_dim * k; i++) {
+        float g = gate_out[i];
+        hidden[i] = g / (1.f + expf(-g)) * up_out[i];
+    }
+
+    if (down_format == 1) {
+        for (int r = 0; r < k; r++)
+            matvec_f16((const uint16_t *)down_data, hidden + (size_t)r * inter_dim,
+                       down_out + (size_t)r * embed_dim, embed_dim, inter_dim);
+    } else {
+        q8_block *xq_inter = malloc(sizeof(q8_block) * down_bpr * k);
+        for (int r = 0; r < k; r++)
+            quantize_q8(hidden + (size_t)r * inter_dim, xq_inter + (size_t)r * down_bpr, down_bpr);
+        if (down_format == 2)
+            q6k_rows(down_data, embed_dim, down_bpr, xq_inter, k, down_bpr, down_out, embed_dim);
+        else
+            q4k_rows(down_data, embed_dim, down_bpr, xq_inter, k, down_bpr, down_out, embed_dim);
+        free(xq_inter);
+    }
+
+    for (int r = 0; r < k; r++) {
+        float w = weights[r];
+        float *o = output + (size_t)r * embed_dim;
+        const float *d = down_out + (size_t)r * embed_dim;
+        for (int i = 0; i < embed_dim; i++) o[i] += w * d[i];
+    }
+
+    free(xq_embed); free(gate_out); free(up_out); free(down_out);
+}
+
+/* ═══ Batched MoE layer: n_experts experts over k rows, threaded over experts ═══
+ *
+ * row_weights: [n_experts][k]; zero means the row does not use that expert.
+ * Each expert gathers its active rows, runs the multi-row forward, and writes
+ * a private partial; partials are reduced into output afterwards.
+ */
+
+/* Two phases so work is split finely across threads even for a single token:
+ *   A: (expert, chunk of inter rows)  -> hidden = silu(gate x) * (up x)
+ *   B: (expert, chunk of embed rows)  -> partial = w * down(hidden)
+ * Within a task, the active rows of the batch are processed 4 at a time. */
+
+#define MOE_INTER_CHUNK 96
+#define MOE_EMBED_CHUNK 256
+
+typedef struct {
+    const uint8_t *const *gate_ptrs;
+    const uint8_t *const *up_ptrs;
+    const void *const *down_ptrs;
+    const int *down_fmts;
+    int n_experts, k, embed_dim, inter_dim, gate_bpr, down_bpr;
+    int *n_rows;        /* [n_experts] */
+    int *rows;          /* [n_experts][k] */
+    float *wts;         /* [n_experts][k] */
+    q8_block *xq_in;    /* [n_experts][k][gate_bpr] */
+    float *hidden;      /* [n_experts][k][inter_dim] */
+    float *partials;    /* [n_experts][k][embed_dim] */
+    int n_inter_chunks, n_embed_chunks;
+} moe_ctx;
+
+static void moe_phase_a(void *p, size_t task) {
+    moe_ctx *c = p;
+    int e = (int)(task / c->n_inter_chunks);
+    int ch = (int)(task % c->n_inter_chunks);
+    int n = c->n_rows[e];
+    if (n == 0) return;
+    int r0 = ch * MOE_INTER_CHUNK;
+    int r1 = r0 + MOE_INTER_CHUNK < c->inter_dim ? r0 + MOE_INTER_CHUNK : c->inter_dim;
+    size_t gate_row = (size_t)c->gate_bpr * Q4K_BSIZE;
+    const uint8_t *gate = c->gate_ptrs[e] + r0 * gate_row;
+    const uint8_t *up   = c->up_ptrs[e] + r0 * gate_row;
+    const q8_block *xq = c->xq_in + (size_t)e * c->k * c->gate_bpr;
+    float *hid = c->hidden + (size_t)e * c->k * c->inter_dim;
+
+    float g[MOE_INTER_CHUNK * 4], u[MOE_INTER_CHUNK * 4];
+    for (int b = 0; b < n; b += 4) {
+        int m = n - b < 4 ? n - b : 4;
+        if (m == 1) {
+            const q8_block *x = xq + (size_t)b * c->gate_bpr;
+            float *h = hid + (size_t)b * c->inter_dim;
+            for (int r = r0; r < r1; r++) {
+                float gv = dot_q4k_q8(gate + (size_t)(r - r0) * gate_row, x, c->gate_bpr);
+                float uv = dot_q4k_q8(up + (size_t)(r - r0) * gate_row, x, c->gate_bpr);
+                h[r] = gv / (1.f + expf(-gv)) * uv;
+            }
+            continue;
+        }
+        const q8_block *px[4];
+        for (int j = 0; j < 4; j++)
+            px[j] = xq + (size_t)(b + (j < m ? j : m - 1)) * c->gate_bpr;
+        for (int r = r0; r < r1; r++) {
+            dot_q4k_q8_x4(gate + (size_t)(r - r0) * gate_row, px, c->gate_bpr, g + (r - r0) * 4);
+            dot_q4k_q8_x4(up + (size_t)(r - r0) * gate_row, px, c->gate_bpr, u + (r - r0) * 4);
+        }
+        for (int j = 0; j < m; j++) {
+            float *h = hid + (size_t)(b + j) * c->inter_dim;
+            for (int r = r0; r < r1; r++) {
+                float gv = g[(r - r0) * 4 + j];
+                h[r] = gv / (1.f + expf(-gv)) * u[(r - r0) * 4 + j];
+            }
+        }
+    }
+}
+
+static void moe_phase_b(void *p, size_t task) {
+    moe_ctx *c = p;
+    int e = (int)(task / c->n_embed_chunks);
+    int ch = (int)(task % c->n_embed_chunks);
+    int n = c->n_rows[e];
+    if (n == 0) return;
+    int r0 = ch * MOE_EMBED_CHUNK;
+    int r1 = r0 + MOE_EMBED_CHUNK < c->embed_dim ? r0 + MOE_EMBED_CHUNK : c->embed_dim;
+    const float *hid = c->hidden + (size_t)e * c->k * c->inter_dim;
+    float *part = c->partials + (size_t)e * c->k * c->embed_dim;
+    const float *wt = c->wts + (size_t)e * c->k;
+    int fmt = c->down_fmts[e];
+    const void *down = c->down_ptrs[e];
+
+    if (fmt == 1) {
+        const uint16_t *w = (const uint16_t *)down;
+        for (int j = 0; j < n; j++)
+            matvec_f16(w + (size_t)r0 * c->inter_dim, hid + (size_t)j * c->inter_dim,
+                       part + (size_t)j * c->embed_dim + r0, r1 - r0, c->inter_dim);
+        for (int j = 0; j < n; j++)
+            for (int r = r0; r < r1; r++) part[(size_t)j * c->embed_dim + r] *= wt[j];
+        return;
+    }
+
+    size_t row_bytes = (size_t)c->down_bpr * (fmt == 2 ? Q6K_BSIZE : Q4K_BSIZE);
+    const uint8_t *mat = (const uint8_t *)down + r0 * row_bytes;
+    q8_block xq[n * c->down_bpr];
+    for (int j = 0; j < n; j++)
+        quantize_q8(hid + (size_t)j * c->inter_dim, xq + (size_t)j * c->down_bpr, c->down_bpr);
+
+    for (int b = 0; b < n; b += 4) {
+        int m = n - b < 4 ? n - b : 4;
+        if (m == 1) {
+            const q8_block *x = xq + (size_t)b * c->down_bpr;
+            float *o = part + (size_t)b * c->embed_dim;
+            for (int r = r0; r < r1; r++) {
+                const uint8_t *wr = mat + (size_t)(r - r0) * row_bytes;
+                float v = fmt == 2 ? dot_q6k_q8(wr, x, c->down_bpr) : dot_q4k_q8(wr, x, c->down_bpr);
+                o[r] = wt[b] * v;
+            }
+            continue;
+        }
+        const q8_block *px[4];
+        for (int j = 0; j < 4; j++)
+            px[j] = xq + (size_t)(b + (j < m ? j : m - 1)) * c->down_bpr;
+        for (int r = r0; r < r1; r++) {
+            float o[4];
+            const uint8_t *wr = mat + (size_t)(r - r0) * row_bytes;
+            if (fmt == 2) dot_q6k_q8_x4(wr, px, c->down_bpr, o);
+            else          dot_q4k_q8_x4(wr, px, c->down_bpr, o);
+            for (int j = 0; j < m; j++)
+                part[(size_t)(b + j) * c->embed_dim + r] = wt[b + j] * o[j];
+        }
+    }
+}
+
+void tg_moe_forward_rows(
+    const uint8_t *const *gate_ptrs, const uint8_t *const *up_ptrs,
+    const void *const *down_ptrs, const int *down_fmts, int n_experts,
+    const float *row_weights, const float *inputs, float *output, int k,
+    int embed_dim, int inter_dim)
+{
+    int gate_bpr = embed_dim / QK_K, down_bpr = inter_dim / QK_K;
+    moe_ctx c = { gate_ptrs, up_ptrs, down_ptrs, down_fmts,
+                  n_experts, k, embed_dim, inter_dim, gate_bpr, down_bpr };
+    c.n_rows = calloc(n_experts, sizeof(int));
+    c.rows = malloc(sizeof(int) * n_experts * k);
+    c.wts = malloc(sizeof(float) * n_experts * k);
+    c.xq_in = malloc(sizeof(q8_block) * (size_t)n_experts * k * gate_bpr);
+    c.hidden = malloc(sizeof(float) * (size_t)n_experts * k * inter_dim);
+    c.partials = calloc((size_t)n_experts * k * embed_dim, sizeof(float));
+    c.n_inter_chunks = (inter_dim + MOE_INTER_CHUNK - 1) / MOE_INTER_CHUNK;
+    c.n_embed_chunks = (embed_dim + MOE_EMBED_CHUNK - 1) / MOE_EMBED_CHUNK;
+
+    /* Quantize each batch row once, then point each expert's active rows at it. */
+    q8_block *xq_rows = malloc(sizeof(q8_block) * (size_t)k * gate_bpr);
+    for (int r = 0; r < k; r++)
+        quantize_q8(inputs + (size_t)r * embed_dim, xq_rows + (size_t)r * gate_bpr, gate_bpr);
+    for (int e = 0; e < n_experts; e++) {
+        const float *w = row_weights + (size_t)e * k;
+        int n = 0;
+        for (int r = 0; r < k; r++) {
+            if (w[r] == 0.f) continue;
+            c.rows[e * k + n] = r;
+            c.wts[e * k + n] = w[r];
+            memcpy(c.xq_in + ((size_t)e * k + n) * gate_bpr, xq_rows + (size_t)r * gate_bpr,
+                   sizeof(q8_block) * gate_bpr);
+            n++;
+        }
+        c.n_rows[e] = n;
+    }
+
+    tg_parallel_for((size_t)n_experts * c.n_inter_chunks, moe_phase_a, &c);
+    tg_parallel_for((size_t)n_experts * c.n_embed_chunks, moe_phase_b, &c);
+
+    for (int e = 0; e < n_experts; e++) {
+        for (int j = 0; j < c.n_rows[e]; j++) {
+            float *o = output + (size_t)c.rows[e * k + j] * embed_dim;
+            const float *p = c.partials + ((size_t)e * k + j) * embed_dim;
+            for (int i = 0; i < embed_dim; i++) o[i] += p[i];
+        }
+    }
+    free(xq_rows); free(c.n_rows); free(c.rows); free(c.wts);
+    free(c.xq_in); free(c.hidden); free(c.partials);
 }
 
 /* ═══ Batch expert forward ═══ */

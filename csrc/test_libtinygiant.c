@@ -60,6 +60,37 @@ static float dot_q4k_q8_scalar_ref(const uint8_t *q4, const q8_block *xq, int bp
     return total;
 }
 
+/* Scalar Q6_K reference (original byte-loop unpack) */
+static float dot_q6k_q8_scalar_ref(const uint8_t *q6, const q8_block *xq, int bpr) {
+    float total = 0;
+    for (int b = 0; b < bpr; b++) {
+        const uint8_t *bl = q6 + b * Q6K_BSIZE;
+        const uint8_t *ql = bl, *qh = bl + 128;
+        const int8_t *sc = (const int8_t *)(bl + 192);
+        uint16_t dr; memcpy(&dr, bl + 208, 2);
+        float d = f16_to_f32(dr);
+        const int8_t *xqs = xq[b].qs;
+        float block_sum = 0;
+        for (int half = 0; half < 2; half++) {
+            const uint8_t *ql_h = ql + half * 64, *qh_h = qh + half * 32;
+            const int8_t *sc_h = sc + half * 8, *xq_h = xqs + half * 128;
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                int8_t q1 = (int8_t)((ql_h[l] & 0xF) | (((qh_h[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = (int8_t)((ql_h[l + 32] & 0xF) | (((qh_h[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql_h[l] >> 4) | (((qh_h[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = (int8_t)((ql_h[l + 32] >> 4) | (((qh_h[l] >> 6) & 3) << 4)) - 32;
+                block_sum += (float)sc_h[is + 0] * (float)(q1 * xq_h[l]);
+                block_sum += (float)sc_h[is + 2] * (float)(q2 * xq_h[l + 32]);
+                block_sum += (float)sc_h[is + 4] * (float)(q3 * xq_h[l + 64]);
+                block_sum += (float)sc_h[is + 6] * (float)(q4 * xq_h[l + 96]);
+            }
+        }
+        total += d * xq[b].scale * block_sum;
+    }
+    return total;
+}
+
 static void fill_q4k_block(uint8_t *block, int seed) {
     srand(seed);
     /* d and dmin: small positive f16 values */
@@ -290,6 +321,188 @@ int main(void) {
         }
 
         free(expert);
+    }
+
+    /* Test 5: 4-row Q4_K kernel matches single-row kernel */
+    printf("Test 5: dot_q4k_q8_x4 vs dot_q4k_q8 (8 blocks, 4 rows)\n");
+    {
+        int bpr = 8;
+        uint8_t *row = malloc(bpr * Q4K_BSIZE);
+        for (int b = 0; b < bpr; b++) fill_q4k_block(row + b * Q4K_BSIZE, 100 + b);
+        q8_block xq[4][8];
+        const q8_block *p[4];
+        for (int r = 0; r < 4; r++) {
+            float x[2048];
+            srand(500 + r);
+            for (int i = 0; i < 2048; i++)
+                x[i] = ((float)rand() / (float)0x7fffffff - 0.5f) * 0.1f;
+            quantize_q8(x, xq[r], bpr);
+            p[r] = xq[r];
+        }
+        float o4[4];
+        dot_q4k_q8_x4(row, p, bpr, o4);
+        float max_rel = 0;
+        for (int r = 0; r < 4; r++) {
+            float o1 = dot_q4k_q8(row, xq[r], bpr);
+            float denom = fabsf(o1) > 1e-3f ? fabsf(o1) : 1.f;
+            float rel = fabsf(o1 - o4[r]) / denom;
+            if (rel > max_rel) max_rel = rel;
+        }
+        printf("  Max relative error: %.4e\n", max_rel);
+        if (max_rel < 1e-5f) printf("  PASS\n\n"); else { printf("  FAIL\n\n"); pass = 0; }
+        free(row);
+    }
+
+    /* Test 6: vectorized Q6_K unpack matches scalar reference, x4 matches x1 */
+    printf("Test 6: Q6_K NEON unpack vs scalar reference; x4 vs x1\n");
+    {
+        int bpr = 3;
+        uint8_t *row = malloc(bpr * Q6K_BSIZE);
+        srand(777);
+        for (int i = 0; i < bpr * Q6K_BSIZE; i++) row[i] = rand() & 0xFF;
+        for (int b = 0; b < bpr; b++) {
+            uint16_t d_f16 = 0x3400;
+            memcpy(row + b * Q6K_BSIZE + 208, &d_f16, 2);
+            int8_t *sc = (int8_t *)(row + b * Q6K_BSIZE + 192);
+            for (int i = 0; i < 16; i++) sc[i] = (int8_t)((rand() % 60) - 30);
+        }
+        q8_block xq[4][3];
+        const q8_block *p[4];
+        for (int r = 0; r < 4; r++) {
+            float x[768];
+            srand(600 + r);
+            for (int i = 0; i < 768; i++)
+                x[i] = ((float)rand() / (float)0x7fffffff - 0.5f) * 0.1f;
+            quantize_q8(x, xq[r], bpr);
+            p[r] = xq[r];
+        }
+        float max_rel = 0;
+        for (int r = 0; r < 4; r++) {
+            float ref = dot_q6k_q8_scalar_ref(row, xq[r], bpr);
+            float got = dot_q6k_q8(row, xq[r], bpr);
+            float denom = fabsf(ref) > 1e-3f ? fabsf(ref) : 1.f;
+            float rel = fabsf(ref - got) / denom;
+            if (rel > max_rel) max_rel = rel;
+        }
+        float o4[4];
+        dot_q6k_q8_x4(row, p, bpr, o4);
+        for (int r = 0; r < 4; r++) {
+            float o1 = dot_q6k_q8(row, xq[r], bpr);
+            float denom = fabsf(o1) > 1e-3f ? fabsf(o1) : 1.f;
+            float rel = fabsf(o1 - o4[r]) / denom;
+            if (rel > max_rel) max_rel = rel;
+        }
+        printf("  Max relative error: %.4e\n", max_rel);
+        if (max_rel < 1e-5f) printf("  PASS\n\n"); else { printf("  FAIL\n\n"); pass = 0; }
+        free(row);
+    }
+
+    /* Test 7: multi-row expert forward matches per-row calls; threaded MoE matches serial */
+    printf("Test 7: tg_expert_forward_rows / tg_moe_forward_rows vs per-row single kernels\n");
+    {
+        int embed = 2048, inter = 768, k = 6, n_exp = 8;
+        int gate_bpr = embed / QK_K, down_bpr = inter / QK_K;
+        size_t gate_bytes = (size_t)inter * gate_bpr * Q4K_BSIZE;
+        size_t down_q4 = (size_t)embed * down_bpr * Q4K_BSIZE;
+        size_t down_q6 = (size_t)embed * down_bpr * Q6K_BSIZE;
+
+        uint8_t *gates[8], *ups[8]; void *downs[8]; int fmts[8];
+        for (int e = 0; e < n_exp; e++) {
+            gates[e] = malloc(gate_bytes); ups[e] = malloc(gate_bytes);
+            for (size_t i = 0; i < gate_bytes; i += Q4K_BSIZE) {
+                fill_q4k_block(gates[e] + i, (int)(i / Q4K_BSIZE) + e * 1000);
+                fill_q4k_block(ups[e] + i, (int)(i / Q4K_BSIZE) + e * 1000 + 7);
+            }
+            fmts[e] = e % 2 ? 2 : 0;
+            if (fmts[e] == 0) {
+                downs[e] = malloc(down_q4);
+                for (size_t i = 0; i < down_q4; i += Q4K_BSIZE)
+                    fill_q4k_block((uint8_t *)downs[e] + i, (int)(i / Q4K_BSIZE) + e * 3000);
+            } else {
+                downs[e] = malloc(down_q6);
+                srand(e * 91);
+                uint8_t *d = downs[e];
+                for (size_t i = 0; i < down_q6; i++) d[i] = rand() & 0xFF;
+                for (size_t b = 0; b < down_q6 / Q6K_BSIZE; b++) {
+                    uint16_t d_f16 = 0x3400;
+                    memcpy(d + b * Q6K_BSIZE + 208, &d_f16, 2);
+                    int8_t *sc = (int8_t *)(d + b * Q6K_BSIZE + 192);
+                    for (int i = 0; i < 16; i++) sc[i] = (int8_t)((rand() % 60) - 30);
+                }
+            }
+        }
+
+        float *inputs = malloc(sizeof(float) * k * embed);
+        srand(4242);
+        for (int i = 0; i < k * embed; i++)
+            inputs[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.01f;
+
+        /* Sparse row weights: each row uses 3 experts */
+        float rw[8 * 6];
+        memset(rw, 0, sizeof(rw));
+        for (int r = 0; r < k; r++)
+            for (int j = 0; j < 3; j++) rw[((r + j * 2) % n_exp) * k + r] = 0.2f + 0.1f * j;
+
+        /* Reference: per-row, per-expert single kernel */
+        float *ref = calloc((size_t)k * embed, sizeof(float));
+        for (int r = 0; r < k; r++)
+            for (int e = 0; e < n_exp; e++)
+                if (rw[e * k + r] != 0.f)
+                    tg_expert_forward_mixed(gates[e], ups[e], downs[e], fmts[e],
+                                            inputs + r * embed, ref + r * embed,
+                                            rw[e * k + r], embed, inter);
+
+        float *got1 = calloc((size_t)k * embed, sizeof(float));
+        tg_moe_forward_rows((const uint8_t *const *)gates, (const uint8_t *const *)ups,
+                            (const void *const *)downs, fmts, n_exp,
+                            rw, inputs, got1, k, embed, inter);
+
+        tg_set_threads(8);
+        float *got8 = calloc((size_t)k * embed, sizeof(float));
+        tg_moe_forward_rows((const uint8_t *const *)gates, (const uint8_t *const *)ups,
+                            (const void *const *)downs, fmts, n_exp,
+                            rw, inputs, got8, k, embed, inter);
+        tg_set_threads(1);
+
+        float max_abs = 0, scale = 0;
+        for (int i = 0; i < k * embed; i++) {
+            if (fabsf(ref[i]) > scale) scale = fabsf(ref[i]);
+            float e1 = fabsf(ref[i] - got1[i]), e8 = fabsf(ref[i] - got8[i]);
+            if (e1 > max_abs) max_abs = e1;
+            if (e8 > max_abs) max_abs = e8;
+        }
+        printf("  Max abs error %.4e vs output scale %.4e (ratio %.2e)\n",
+               max_abs, scale, max_abs / scale);
+        if (max_abs < 1e-5f * scale) printf("  PASS\n\n"); else { printf("  FAIL\n\n"); pass = 0; }
+
+        for (int e = 0; e < n_exp; e++) { free(gates[e]); free(ups[e]); free(downs[e]); }
+        free(inputs); free(ref); free(got1); free(got8);
+    }
+
+    /* Test 8: threaded matmul_q4k matches serial */
+    printf("Test 8: threaded matmul_q4k vs serial (4096x2048)\n");
+    {
+        int nrows = 4096, ncols = 2048, bpr = ncols / QK_K;
+        uint8_t *mat = malloc((size_t)nrows * bpr * Q4K_BSIZE);
+        for (int r = 0; r < nrows; r++)
+            for (int b = 0; b < bpr; b++)
+                fill_q4k_block(mat + ((size_t)r * bpr + b) * Q4K_BSIZE, r * 3 + b);
+        float x[2048];
+        srand(31337);
+        for (int i = 0; i < 2048; i++) x[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.02f;
+        float *o1 = malloc(sizeof(float) * nrows), *o8 = malloc(sizeof(float) * nrows);
+        matmul_q4k(mat, x, o1, nrows, ncols);
+        tg_set_threads(8);
+        matmul_q4k(mat, x, o8, nrows, ncols);
+        tg_set_threads(1);
+        float max_abs = 0;
+        for (int r = 0; r < nrows; r++) {
+            float e = fabsf(o1[r] - o8[r]);
+            if (e > max_abs) max_abs = e;
+        }
+        printf("  Max absolute diff: %.4e\n", max_abs);
+        if (max_abs == 0.f) printf("  PASS\n\n"); else { printf("  FAIL\n\n"); pass = 0; }
+        free(mat); free(o1); free(o8);
     }
 
     printf("==================================\n");
