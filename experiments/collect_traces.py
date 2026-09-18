@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tinygiant._constants import EMBED_DIM, N_EXPERTS, N_EXPERTS_USED, N_LAYERS
+
 from tinygiant._tokenizer import load_tokenizer
 from tinygiant.engine import NWSEngine
 from tinygiant.trace import TraceRecorder
@@ -46,7 +46,8 @@ def main():
     for name in names:
         ids = tok.encode(PROMPTS[name])
         engine.reset_kv()
-        rec = TraceRecorder(N_LAYERS, N_EXPERTS, N_EXPERTS_USED, EMBED_DIM, keep_hidden=True)
+        S = engine.spec
+        rec = TraceRecorder(S.n_layers, S.n_experts, S.n_experts_used, S.embed_dim, keep_hidden=True)
         engine.trace = rec
         # single-row prefill so every prompt token is traced too
         logits = None

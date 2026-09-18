@@ -18,15 +18,19 @@ class RoutingConfig:
 
 class Router:
 
-    def __init__(self, routers, n_used):
+    def __init__(self, routers, n_used, biases=None):
         self.routers = routers
+        self.biases = biases
         self.k = n_used
         self.n_experts = routers[0].shape[0]
         self.stats = dict(slots=0, swapped=0, displaced_mass=0.0, restricted_fallback=0)
         self.rng = np.random.default_rng(0)
 
     def logits(self, layer, normed):
-        return self.routers[layer] @ normed
+        l = self.routers[layer] @ normed
+        if self.biases is not None:
+            l = l + self.biases[layer]
+        return l
 
     def _topk(self, v):
         idx = np.argpartition(v, -self.k)[-self.k:]

@@ -6,7 +6,7 @@ import numpy as np
 class LookaheadPredictor:
     """Applies layer (l+j)'s router to the residual stream at layer l."""
 
-    def __init__(self, routers, ffn_norms, eps):
+    def __init__(self, routers, ffn_norms, eps, biases=None):
         self.routers = routers
         self.ffn_norms = ffn_norms
         self.eps = eps
@@ -16,6 +16,7 @@ class LookaheadPredictor:
         self.folded = np.ascontiguousarray(
             np.stack([r * n[None, :] for r, n in zip(routers, ffn_norms)]), dtype=np.float32)
         self.n_experts = self.folded.shape[1]
+        self.biases = np.stack(biases).astype(np.float32) if biases is not None else None
 
     def candidates(self, l0, l1, X, n):
         """Boolean [l1-l0, n_experts] of the top-n predicted experts for target
@@ -24,6 +25,8 @@ class LookaheadPredictor:
         Xn = X / rr
         J = l1 - l0
         logits = (Xn @ self.folded[l0:l1].reshape(J * self.n_experts, -1).T).reshape(-1, J, self.n_experts)
+        if self.biases is not None:
+            logits = logits + self.biases[l0:l1][None]
         idx = np.argpartition(logits, -n, axis=2)[:, :, -n:]     # [k, J, n]
         cand = np.zeros((J, self.n_experts), bool)
         jj = np.broadcast_to(np.arange(J)[None, :, None], idx.shape)
@@ -34,15 +37,10 @@ class LookaheadPredictor:
         rr = np.sqrt(np.mean(x * x) + self.eps)
         normed = (x / rr) * self.ffn_norms[target_layer]
         logits = self.routers[target_layer] @ normed
+        if self.biases is not None:
+            logits = logits + self.biases[target_layer]
         idx = np.argpartition(logits, -n)[-n:]
         return idx[np.argsort(logits[idx])[::-1]]
-
-    def predict_rows(self, target_layer, X, n):
-        """Union of the top-n predicted experts over all rows of X [k, D]."""
-        rr = np.sqrt(np.mean(X * X, axis=1, keepdims=True) + self.eps)
-        logits = (X / rr * self.ffn_norms[target_layer]) @ self.routers[target_layer].T
-        idx = np.argpartition(logits, -n, axis=1)[:, -n:]
-        return np.unique(idx)
 
 
 class TokenPrior:

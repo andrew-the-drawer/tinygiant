@@ -22,10 +22,11 @@ from gguf.quants import dequantize as gguf_dequantize
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tinygiant._constants import N_EXPERTS, N_EXPERTS_USED, N_LAYERS, RMS_EPS
 from tinygiant.predict import TokenPrior
+from tinygiant.spec import ModelSpec
 
-K = N_EXPERTS_USED
+N_EXPERTS = N_EXPERTS_USED = N_LAYERS = K = None
+RMS_EPS = 1e-6
 
 
 def topk(v, k):
@@ -34,18 +35,27 @@ def topk(v, k):
 
 
 def load_model_bits(model_path):
+    global N_EXPERTS, N_EXPERTS_USED, N_LAYERS, K, RMS_EPS
     r = GGUFReader(model_path)
+    spec = ModelSpec.from_gguf(r)
+    N_EXPERTS, N_EXPERTS_USED, N_LAYERS, RMS_EPS = spec.n_experts, spec.n_experts_used, spec.n_layers, spec.rms_eps
+    K = N_EXPERTS_USED
     tm = {t.name: t for t in r.tensors}
     routers = np.stack([gguf_dequantize(tm[f"blk.{i}.ffn_gate_inp.weight"].data,
                                         tm[f"blk.{i}.ffn_gate_inp.weight"].tensor_type).astype(np.float32)
                         for i in range(N_LAYERS)])
-    norms = np.stack([gguf_dequantize(tm[f"blk.{i}.ffn_norm.weight"].data,
-                                      tm[f"blk.{i}.ffn_norm.weight"].tensor_type).astype(np.float32)
+    norms = np.stack([gguf_dequantize(tm[f"blk.{i}.{spec.ffn_norm_name}.weight"].data,
+                                      tm[f"blk.{i}.{spec.ffn_norm_name}.weight"].tensor_type).astype(np.float32)
                       for i in range(N_LAYERS)])
-    return routers, norms
+    if spec.router_bias:
+        bias = np.stack([gguf_dequantize(tm[f"blk.{i}.ffn_gate_inp.bias"].data,
+                                         tm[f"blk.{i}.ffn_gate_inp.bias"].tensor_type).astype(np.float32)
+                         for i in range(N_LAYERS)])
+        return routers, norms, bias
+    return routers, norms, None
 
 
-def lookahead_recall(traces, routers, norms, max_j, extra_list):
+def lookahead_recall(traces, routers, norms, bias, max_j, extra_list):
     """recall[j][extra] = mean fraction of true top-k at layer l+j found in
     top-(k+extra) predicted from hidden state at layer l."""
     res = {}
@@ -60,6 +70,8 @@ def lookahead_recall(traces, routers, norms, max_j, extra_list):
                 h = H[:, l]
                 rr = np.sqrt((h * h).mean(axis=1, keepdims=True) + RMS_EPS)
                 logits = (h / rr * norms[t]) @ routers[t].T   # [T, E]
+                if bias is not None:
+                    logits = logits + bias[t]
                 order = np.argsort(logits, axis=1)[:, ::-1]
                 truth = S[:, t]
                 for x in extra_list:
@@ -170,17 +182,16 @@ def main():
     p.add_argument("--out", default=str(Path(__file__).resolve().parent / "trace_analysis.json"))
     args = p.parse_args()
 
+    routers, norms, bias = load_model_bits(args.model)
     paths = sorted(args.traces)
     traces = [np.load(p) for p in paths]
     n_tokens = sum(d["tokens"].shape[0] for d in traces)
     print(f"{len(traces)} traces, {n_tokens} tokens")
-
-    routers, norms = load_model_bits(args.model)
     out = {}
 
     print("\n1. Lookahead recall (predict layer l+j from hidden state at layer l)")
     extras = [0, 2, 4, 8]
-    la = lookahead_recall(traces, routers, norms, args.max_j, extras)
+    la = lookahead_recall(traces, routers, norms, bias, args.max_j, extras)
     print("   j   " + "  ".join(f"k+{x:<2d}" for x in extras))
     for j, r in la.items():
         print(f"   {j:<3d} " + "  ".join(f"{r[x]:.2f}" for x in extras))

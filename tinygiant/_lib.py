@@ -62,6 +62,20 @@ def load_tinygiant_lib(lib_path=None):
     reg(lib.tg_prefetch_batch, [VP, VP, CI])
     lib.tg_mlock.restype = ctypes.c_int
     lib.tg_mlock.argtypes = [VP, ctypes.c_size_t]
+    reg(lib.tg_attention_v2,
+        [CI, CI, CI, CI,
+         VP, VP, VP, VP,
+         VP, VP, VP, VP,
+         VP, VP, VP,
+         VP, VP, CI, CI, CI,
+         VP, VP,
+         VP, VP,
+         CI, CI, CI, CI, CI, CF])
+    reg(lib.tg_moe_forward_rows_v2,
+        [VP, VP, VP, CI, VP, VP, VP, VP, CI, CI, VP, VP, VP, CI, CI, CI])
+    reg(lib.tg_matmul, [CI, VP, VP, VP, VP, CI, CI])
+    lib.tg_row_bytes.restype = ctypes.c_size_t
+    lib.tg_row_bytes.argtypes = [CI, CI]
     reg(lib.tg_set_threads, [CI])
     lib.tg_get_threads.restype = CI
     lib.tg_get_threads.argtypes = []

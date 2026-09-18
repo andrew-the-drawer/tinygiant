@@ -150,7 +150,7 @@ int main(void) {
                 x[i] = ((float)rand() / (float)0x7fffffff - 0.5f) * 0.1f;
 
             q8_block xq[1];
-            quantize_q8(x, xq, 1);
+            quantize_q8(x, xq, QK_K);
 
             float scalar_q8 = dot_q4k_q8_scalar_ref(block, xq, 1);
             float neon_q8   = dot_q4k_q8(block, xq, 1);
@@ -184,7 +184,7 @@ int main(void) {
             float exact   = dot_q4k_scalar(block, x, 1);
 
             q8_block xq[1];
-            quantize_q8(x, xq, 1);
+            quantize_q8(x, xq, QK_K);
             float q8_ref = dot_q4k_q8_scalar_ref(block, xq, 1);
 
             float denom = fabsf(exact) > 1e-3f ? fabsf(exact) : 1.0f;
@@ -248,7 +248,7 @@ int main(void) {
 
         /* Quantize input once, use for both paths */
         q8_block xq[bpr];
-        quantize_q8(x, xq, bpr);
+        quantize_q8(x, xq, ncols);
 
         float *out_scalar = calloc(nrows, sizeof(float));
         float *out_neon = calloc(nrows, sizeof(float));
@@ -336,7 +336,7 @@ int main(void) {
             srand(500 + r);
             for (int i = 0; i < 2048; i++)
                 x[i] = ((float)rand() / (float)0x7fffffff - 0.5f) * 0.1f;
-            quantize_q8(x, xq[r], bpr);
+            quantize_q8(x, xq[r], 2048);
             p[r] = xq[r];
         }
         float o4[4];
@@ -373,7 +373,7 @@ int main(void) {
             srand(600 + r);
             for (int i = 0; i < 768; i++)
                 x[i] = ((float)rand() / (float)0x7fffffff - 0.5f) * 0.1f;
-            quantize_q8(x, xq[r], bpr);
+            quantize_q8(x, xq[r], 768);
             p[r] = xq[r];
         }
         float max_rel = 0;
@@ -503,6 +503,205 @@ int main(void) {
         printf("  Max absolute diff: %.4e\n", max_abs);
         if (max_abs == 0.f) printf("  PASS\n\n"); else { printf("  FAIL\n\n"); pass = 0; }
         free(mat); free(o1); free(o8);
+    }
+
+    /* Test 9: MXFP4 and Q8_0 kernels vs scalar dequantized references (ncols = 2880) */
+    printf("Test 9: MXFP4 / Q8_0 kernels vs dequantized float reference (ncols 2880)\n");
+    {
+        int ncols = 2880, n_sub = ncols / 32;
+        uint8_t *wm = malloc((size_t)n_sub * MXFP4_BSIZE);
+        uint8_t *w8 = malloc((size_t)n_sub * Q80_BSIZE);
+        float *fm = malloc(sizeof(float) * ncols), *f8 = malloc(sizeof(float) * ncols);
+        srand(2025);
+        for (int s = 0; s < n_sub; s++) {
+            uint8_t *bl = wm + s * MXFP4_BSIZE;
+            bl[0] = (uint8_t)(120 + rand() % 8);
+            for (int i = 0; i < 16; i++) bl[1 + i] = rand() & 0xFF;
+            float d = e8m0_to_fp32_half(bl[0]);
+            for (int i = 0; i < 16; i++) {
+                fm[s * 32 + i]      = d * mxfp4_kvalues[bl[1 + i] & 0xF];
+                fm[s * 32 + 16 + i] = d * mxfp4_kvalues[bl[1 + i] >> 4];
+            }
+            uint8_t *b8 = w8 + s * Q80_BSIZE;
+            uint16_t d16 = 0x2C00;   /* 0.0625 */
+            memcpy(b8, &d16, 2);
+            for (int i = 0; i < 32; i++) {
+                int8_t q = (int8_t)(rand() % 255 - 127);
+                b8[2 + i] = (uint8_t)q;
+                f8[s * 32 + i] = 0.0625f * q;
+            }
+        }
+        float *x = malloc(sizeof(float) * ncols);
+        float *x2 = malloc(sizeof(float) * ncols);
+        for (int i = 0; i < ncols; i++) {
+            x[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.2f;
+            x2[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.2f;
+        }
+        q8_block xq[Q8_NBLOCKS(2880)], xq2[Q8_NBLOCKS(2880)];
+        quantize_q8(x, xq, ncols);
+        quantize_q8(x2, xq2, ncols);
+        float ref_m = 0, ref_8 = 0, ref_m2 = 0;
+        for (int i = 0; i < ncols; i++) { ref_m += fm[i] * x[i]; ref_8 += f8[i] * x[i]; ref_m2 += fm[i] * x2[i]; }
+        float got_m = dot_mxfp4_q8(wm, xq, ncols);
+        float got_8 = dot_q80_q8(w8, xq, ncols);
+        const q8_block *px[4] = { xq, xq2, xq, xq2 };
+        float o4[4];
+        dot_mxfp4_q8_x4(wm, px, ncols, o4);
+        float e1 = fabsf(got_m - ref_m) / fabsf(ref_m), e2 = fabsf(got_8 - ref_8) / fabsf(ref_8);
+        float e3 = fabsf(o4[0] - got_m) / fabsf(got_m), e4 = fabsf(o4[1] - ref_m2) / fabsf(ref_m2);
+        printf("  mxfp4 rel err %.3e, q8_0 rel err %.3e, x4 vs x1 %.3e, x4 row2 vs ref %.3e\n", e1, e2, e3, e4);
+        if (e1 < 0.02f && e2 < 0.02f && e3 < 1e-5f && e4 < 0.02f) printf("  PASS\n\n");
+        else { printf("  FAIL\n\n"); pass = 0; }
+        free(wm); free(w8); free(fm); free(f8); free(x); free(x2);
+    }
+
+    /* Test 10: generalized MoE (MXFP4 experts, gpt-oss activation, biases) vs float reference */
+    printf("Test 10: tg_moe_forward_rows_v2 with MXFP4 + gpt-oss activation + biases\n");
+    {
+        int embed = 2880, inter = 2880, k = 3, n_exp = 2;
+        int n_sub_e = embed / 32, n_sub_i = inter / 32;
+        size_t gate_bytes = (size_t)inter * n_sub_e * MXFP4_BSIZE;
+        size_t down_bytes = (size_t)embed * n_sub_i * MXFP4_BSIZE;
+        uint8_t *gates[2], *ups[2], *downs[2];
+        float *fg[2], *fu[2], *fd[2], *bg[2], *bu[2], *bd[2];
+        int fmts[2] = { TG_FMT_MXFP4, TG_FMT_MXFP4 };
+        srand(77);
+        for (int e = 0; e < n_exp; e++) {
+            gates[e] = malloc(gate_bytes); ups[e] = malloc(gate_bytes); downs[e] = malloc(down_bytes);
+            fg[e] = malloc(sizeof(float) * inter * embed); fu[e] = malloc(sizeof(float) * inter * embed);
+            fd[e] = malloc(sizeof(float) * embed * inter);
+            bg[e] = malloc(sizeof(float) * inter); bu[e] = malloc(sizeof(float) * inter); bd[e] = malloc(sizeof(float) * embed);
+            uint8_t *mats[3] = { gates[e], ups[e], downs[e] };
+            float *fl[3] = { fg[e], fu[e], fd[e] };
+            size_t nsub[3] = { (size_t)inter * n_sub_e, (size_t)inter * n_sub_e, (size_t)embed * n_sub_i };
+            for (int m = 0; m < 3; m++) {
+                for (size_t s = 0; s < nsub[m]; s++) {
+                    uint8_t *bl = mats[m] + s * MXFP4_BSIZE;
+                    bl[0] = (uint8_t)(112 + rand() % 6);
+                    for (int i = 0; i < 16; i++) bl[1 + i] = rand() & 0xFF;
+                    float d = e8m0_to_fp32_half(bl[0]);
+                    for (int i = 0; i < 16; i++) {
+                        fl[m][s * 32 + i]      = d * mxfp4_kvalues[bl[1 + i] & 0xF];
+                        fl[m][s * 32 + 16 + i] = d * mxfp4_kvalues[bl[1 + i] >> 4];
+                    }
+                }
+            }
+            for (int i = 0; i < inter; i++) { bg[e][i] = ((float)rand() / RAND_MAX - 0.5f); bu[e][i] = ((float)rand() / RAND_MAX - 0.5f); }
+            for (int i = 0; i < embed; i++) bd[e][i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
+        }
+        float *inputs = malloc(sizeof(float) * k * embed);
+        for (int i = 0; i < k * embed; i++) inputs[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.f;
+        float rw[2 * 3] = { 0.6f, 0.f, 0.3f,  0.4f, 1.0f, 0.7f };
+
+        /* float reference */
+        float *ref = calloc((size_t)k * embed, sizeof(float));
+        float *h = malloc(sizeof(float) * inter);
+        for (int e = 0; e < n_exp; e++) for (int r = 0; r < k; r++) {
+            float w = rw[e * k + r];
+            if (w == 0.f) continue;
+            const float *x = inputs + (size_t)r * embed;
+            for (int i = 0; i < inter; i++) {
+                float g = bg[e][i], u = bu[e][i];
+                for (int j = 0; j < embed; j++) { g += fg[e][(size_t)i * embed + j] * x[j]; u += fu[e][(size_t)i * embed + j] * x[j]; }
+                if (g > 7.f) g = 7.f;
+                if (u > 7.f) u = 7.f; else if (u < -7.f) u = -7.f;
+                h[i] = g / (1.f + expf(-1.702f * g)) * (u + 1.f);
+            }
+            for (int i = 0; i < embed; i++) {
+                float d = bd[e][i];
+                for (int j = 0; j < inter; j++) d += fd[e][(size_t)i * inter + j] * h[j];
+                ref[(size_t)r * embed + i] += w * d;
+            }
+        }
+        float *got = calloc((size_t)k * embed, sizeof(float));
+        tg_set_threads(6);
+        tg_moe_forward_rows_v2((const uint8_t *const *)gates, (const uint8_t *const *)ups,
+                               (const void *const *)downs, TG_FMT_MXFP4, fmts,
+                               (const float *const *)bg, (const float *const *)bu, (const float *const *)bd,
+                               TG_ACT_GPTOSS, n_exp, rw, inputs, got, k, embed, inter);
+        tg_set_threads(1);
+        float max_abs = 0, scale = 0;
+        for (int i = 0; i < k * embed; i++) {
+            if (fabsf(ref[i]) > scale) scale = fabsf(ref[i]);
+            float e = fabsf(ref[i] - got[i]);
+            if (e > max_abs) max_abs = e;
+        }
+        printf("  Max abs error %.4e vs output scale %.4e (ratio %.2e)\n", max_abs, scale, max_abs / scale);
+        if (max_abs < 0.03f * scale) printf("  PASS\n\n"); else { printf("  FAIL\n\n"); pass = 0; }
+        for (int e = 0; e < n_exp; e++) { free(gates[e]); free(ups[e]); free(downs[e]); free(fg[e]); free(fu[e]); free(fd[e]); free(bg[e]); free(bu[e]); free(bd[e]); }
+        free(inputs); free(ref); free(h); free(got);
+    }
+
+    /* Test 11: tg_attention_v2 equals the Q4 kernel, and window/sink behave */
+    printf("Test 11: tg_attention_v2 vs tg_attention_decode_q4; sliding window; sinks\n");
+    {
+        int embed = 2048, n_heads = 32, n_kv = 4, hd = 128, q_dim = n_heads * hd, kv_dim = n_kv * hd;
+        int kv_max = 64, bpr = embed / QK_K;
+        uint8_t *wq = malloc((size_t)q_dim * bpr * Q4K_BSIZE), *wk = malloc((size_t)kv_dim * bpr * Q4K_BSIZE);
+        uint8_t *wo = malloc((size_t)embed * (q_dim / QK_K) * Q4K_BSIZE);
+        uint16_t *wv = malloc(sizeof(uint16_t) * kv_dim * embed);
+        for (int r = 0; r < q_dim; r++) for (int b = 0; b < bpr; b++) fill_q4k_block(wq + ((size_t)r * bpr + b) * Q4K_BSIZE, r + b);
+        for (int r = 0; r < kv_dim; r++) for (int b = 0; b < bpr; b++) fill_q4k_block(wk + ((size_t)r * bpr + b) * Q4K_BSIZE, 5 * r + b);
+        for (int r = 0; r < embed; r++) for (int b = 0; b < q_dim / QK_K; b++) fill_q4k_block(wo + ((size_t)r * (q_dim / QK_K) + b) * Q4K_BSIZE, 7 * r + b);
+        srand(11);
+        for (size_t i = 0; i < (size_t)kv_dim * embed; i++) wv[i] = (uint16_t)(0x2000 + (rand() % 0x800));
+        float qn[128], kn[128];
+        for (int i = 0; i < hd; i++) { qn[i] = 1.f + 0.01f * i; kn[i] = 1.f - 0.001f * i; }
+        float *cosv = malloc(sizeof(float) * kv_max * hd / 2), *sinv = malloc(sizeof(float) * kv_max * hd / 2);
+        for (int p = 0; p < kv_max; p++) for (int i = 0; i < hd / 2; i++) {
+            float f = p / powf(10000.f, 2.f * i / hd); cosv[p * hd / 2 + i] = cosf(f); sinv[p * hd / 2 + i] = sinf(f);
+        }
+        float *kv1k = calloc((size_t)n_kv * kv_max * hd, sizeof(float)), *kv1v = calloc((size_t)n_kv * kv_max * hd, sizeof(float));
+        float *kv2k = calloc((size_t)n_kv * kv_max * hd, sizeof(float)), *kv2v = calloc((size_t)n_kv * kv_max * hd, sizeof(float));
+        float *kv3k = calloc((size_t)n_kv * kv_max * hd, sizeof(float)), *kv3v = calloc((size_t)n_kv * kv_max * hd, sizeof(float));
+        float in[2048], o1[2048], o2[2048], o3[2048], o4[2048];
+        float sinks_low[32];
+        for (int h = 0; h < n_heads; h++) sinks_low[h] = -1e9f;
+        float max_d = 0, max_win = 0, max_sink = 0;
+        int n_steps = 12, window = 5;
+        for (int p = 0; p < n_steps; p++) {
+            srand(100 + p);
+            for (int i = 0; i < embed; i++) in[i] = ((float)rand() / RAND_MAX - 0.5f);
+            tg_attention_decode_q4(wq, wk, wv, wo, qn, kn, kv1k, kv1v, p, kv_max, cosv, sinv, in, o1,
+                                   embed, n_heads, n_kv, hd, p);
+            tg_attention_v2(TG_FMT_Q4K, TG_FMT_Q4K, TG_FMT_F16, TG_FMT_Q4K, wq, wk, wv, wo,
+                            NULL, NULL, NULL, NULL, qn, kn, NULL, kv2k, kv2v, p, kv_max, 0,
+                            cosv, sinv, in, o2, embed, n_heads, n_kv, hd, p, 1e-6f);
+            tg_attention_v2(TG_FMT_Q4K, TG_FMT_Q4K, TG_FMT_F16, TG_FMT_Q4K, wq, wk, wv, wo,
+                            NULL, NULL, NULL, NULL, qn, kn, sinks_low, kv3k, kv3v, p, kv_max, 0,
+                            cosv, sinv, in, o3, embed, n_heads, n_kv, hd, p, 1e-6f);
+            for (int i = 0; i < embed; i++) {
+                float d = fabsf(o1[i] - o2[i]); if (d > max_d) max_d = d;
+                float s = fabsf(o2[i] - o3[i]); if (s > max_sink) max_sink = s;
+            }
+            /* window: result must equal full attention over a KV cache holding only the last `window` positions */
+            if (p >= window) {
+                float *kvwk = calloc((size_t)n_kv * kv_max * hd, sizeof(float)), *kvwv = calloc((size_t)n_kv * kv_max * hd, sizeof(float));
+                int start = p + 1 - window;
+                for (int h = 0; h < n_kv; h++)
+                    for (int t = start; t < p; t++) {
+                        memcpy(kvwk + ((size_t)h * kv_max + t - start) * hd, kv2k + ((size_t)h * kv_max + t) * hd, hd * sizeof(float));
+                        memcpy(kvwv + ((size_t)h * kv_max + t - start) * hd, kv2v + ((size_t)h * kv_max + t) * hd, hd * sizeof(float));
+                    }
+                float o_win[2048];
+                tg_attention_v2(TG_FMT_Q4K, TG_FMT_Q4K, TG_FMT_F16, TG_FMT_Q4K, wq, wk, wv, wo,
+                                NULL, NULL, NULL, NULL, qn, kn, NULL, kv2k, kv2v, p, kv_max, window,
+                                cosv, sinv, in, o4, embed, n_heads, n_kv, hd, p, 1e-6f);
+                tg_attention_v2(TG_FMT_Q4K, TG_FMT_Q4K, TG_FMT_F16, TG_FMT_Q4K, wq, wk, wv, wo,
+                                NULL, NULL, NULL, NULL, qn, kn, NULL, kvwk, kvwv, p - start, kv_max, 0,
+                                cosv, sinv, in, o_win, embed, n_heads, n_kv, hd, p, 1e-6f);
+                for (int i = 0; i < embed; i++) { float d = fabsf(o4[i] - o_win[i]); if (d > max_win) max_win = d; }
+                free(kvwk); free(kvwv);
+            }
+        }
+        float scale = 0;
+        for (int i = 0; i < embed; i++) if (fabsf(o1[i]) > scale) scale = fabsf(o1[i]);
+        printf("  v2 vs q4 kernel max diff %.3e, window vs truncated cache %.3e, huge-negative sink vs none %.3e (scale %.3e)\n",
+               max_d, max_win, max_sink, scale);
+        if (max_d < 1e-4f * scale && max_win < 1e-4f * scale && max_sink < 1e-4f * scale) printf("  PASS\n\n");
+        else { printf("  FAIL\n\n"); pass = 0; }
+        free(wq); free(wk); free(wo); free(wv); free(cosv); free(sinv);
+        free(kv1k); free(kv1v); free(kv2k); free(kv2v); free(kv3k); free(kv3v);
     }
 
     printf("==================================\n");

@@ -163,12 +163,17 @@ typedef struct {
     int8_t  qs[QK_K];
 } q8_block;
 
-static void quantize_q8(const float *x, q8_block *out, int n_blocks) {
+#define Q8_NBLOCKS(n) (((n) + QK_K - 1) / QK_K)
+
+/* Quantizes ncols floats into 256-wide Q8 blocks; a partial last block is zero padded. */
+static void quantize_q8(const float *x, q8_block *out, int ncols) {
+    int n_blocks = Q8_NBLOCKS(ncols);
     for (int b = 0; b < n_blocks; b++) {
         const float *xb = x + b * QK_K;
+        int n = ncols - b * QK_K < QK_K ? ncols - b * QK_K : QK_K;   /* multiple of 32 */
 
         float32x4_t vmax = vdupq_n_f32(0);
-        for (int i = 0; i < QK_K; i += 4) {
+        for (int i = 0; i < n; i += 4) {
             float32x4_t v = vld1q_f32(xb + i);
             vmax = vmaxq_f32(vmax, vabsq_f32(v));
         }
@@ -182,14 +187,18 @@ static void quantize_q8(const float *x, q8_block *out, int n_blocks) {
         int32_t total = 0;
         for (int j = 0; j < 8; j++) {
             int32x4_t vsum = vdupq_n_s32(0);
-            for (int i = j * 32; i < (j + 1) * 32; i += 4) {
-                float32x4_t v = vld1q_f32(xb + i);
-                float32x4_t scaled = vmulq_f32(v, vinv);
-                int32x4_t rounded = vcvtnq_s32_f32(scaled);
-                int16x4_t n16 = vmovn_s32(rounded);
-                int8x8_t n8 = vmovn_s16(vcombine_s16(n16, n16));
-                vst1_lane_s32((int32_t *)(out[b].qs + i), vreinterpret_s32_s8(n8), 0);
-                vsum = vaddq_s32(vsum, rounded);
+            if (j * 32 < n) {
+                for (int i = j * 32; i < (j + 1) * 32; i += 4) {
+                    float32x4_t v = vld1q_f32(xb + i);
+                    float32x4_t scaled = vmulq_f32(v, vinv);
+                    int32x4_t rounded = vcvtnq_s32_f32(scaled);
+                    int16x4_t n16 = vmovn_s32(rounded);
+                    int8x8_t n8 = vmovn_s16(vcombine_s16(n16, n16));
+                    vst1_lane_s32((int32_t *)(out[b].qs + i), vreinterpret_s32_s8(n8), 0);
+                    vsum = vaddq_s32(vsum, rounded);
+                }
+            } else {
+                memset(out[b].qs + j * 32, 0, 32);
             }
             out[b].bsums[j] = vaddvq_s32(vsum);
             total += out[b].bsums[j];
@@ -358,7 +367,7 @@ static void matmul_q4k(const uint8_t *q4_matrix, const float *input,
                         float *output, int nrows, int ncols) {
     int bpr = ncols / QK_K;
     q8_block xq[bpr];
-    quantize_q8(input, xq, bpr);
+    quantize_q8(input, xq, ncols);
     mm_ctx c = { q4_matrix, xq, output, nrows, bpr, 0 };
     tg_parallel_for((nrows + MM_CHUNK - 1) / MM_CHUNK, mm_task, &c);
 }
@@ -481,7 +490,7 @@ static void matmul_q6k(const uint8_t *q6_matrix, const float *input,
                         float *output, int nrows, int ncols) {
     int bpr = ncols / QK_K;
     q8_block xq[bpr];
-    quantize_q8(input, xq, bpr);
+    quantize_q8(input, xq, ncols);
     mm_ctx c = { q6_matrix, xq, output, nrows, bpr, 1 };
     tg_parallel_for((nrows + MM_CHUNK - 1) / MM_CHUNK, mm_task, &c);
 }
@@ -489,6 +498,136 @@ static void matmul_q6k(const uint8_t *q6_matrix, const float *input,
 void tg_matmul_q6k(const uint8_t *q6_matrix, const float *input,
                     float *output, int nrows, int ncols) {
     matmul_q6k(q6_matrix, input, output, nrows, ncols);
+}
+
+/* ═══ MXFP4 × Q8 fused kernel ═══
+ *
+ * Block of 32 values: 1 byte e8m0 shared exponent, then 16 bytes of e2m1
+ * nibbles (low nibbles = values 0-15, high nibbles = values 16-31).
+ * value = 2^(e-127) * kvalue[nibble] / 2, kvalue = {0,1,2,3,4,6,8,12,0,-1,...,-12}.
+ * Our q8 blocks cover 256 values, i.e. 8 MXFP4 blocks each.
+ */
+
+#define MXFP4_BSIZE 17
+#define MXFP4_PER_Q8 8
+
+static const int8_t mxfp4_kvalues[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+static inline float e8m0_to_fp32_half(uint8_t e) {
+    uint32_t bits = e < 2 ? (0x00200000u << e) : ((uint32_t)(e - 1) << 23);
+    float f; memcpy(&f, &bits, 4); return f;
+}
+
+/* Decodes one MXFP4 block into two 16-lane int8 vectors (doubled e2m1 values). */
+static inline void unpack_mxfp4(const uint8_t *qs, int8x16_t *lo, int8x16_t *hi) {
+    const uint8x16_t m0f = vdupq_n_u8(0x0F);
+    const int8x16_t table = vld1q_s8(mxfp4_kvalues);
+    uint8x16_t raw = vld1q_u8(qs);
+    *lo = vqtbl1q_s8(table, vandq_u8(raw, m0f));
+    *hi = vqtbl1q_s8(table, vshrq_n_u8(raw, 4));
+}
+
+/* 32-wide-block kernels index sub-blocks directly so ncols only needs to be a
+ * multiple of 32 (gpt-oss uses 2880). Sub-block s lives in q8 block s/8. */
+
+static float dot_mxfp4_q8(const uint8_t *w, const q8_block *xq, int ncols) {
+    int n_sub = ncols / 32;
+    float total = 0;
+    for (int s = 0; s < n_sub; s++) {
+        const q8_block *xb = &xq[s >> 3];
+        const int8_t *xqs = xb->qs + (s & 7) * 32;
+        const uint8_t *bl = w + (size_t)s * MXFP4_BSIZE;
+        int8x16_t lo, hi;
+        unpack_mxfp4(bl + 1, &lo, &hi);
+        int32x4_t acc = vdotq_s32(vdupq_n_s32(0), lo, vld1q_s8(xqs));
+        acc = vdotq_s32(acc, hi, vld1q_s8(xqs + 16));
+        total += xb->scale * e8m0_to_fp32_half(bl[0]) * (float)vaddvq_s32(acc);
+    }
+    return total;
+}
+
+static void dot_mxfp4_q8_x4(const uint8_t *w, const q8_block *const xq[4], int ncols, float out[4]) {
+    int n_sub = ncols / 32;
+    float t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+    for (int s = 0; s < n_sub; s++) {
+        int b = s >> 3, o = (s & 7) * 32;
+        const int8_t *x0 = xq[0][b].qs + o, *x1 = xq[1][b].qs + o;
+        const int8_t *x2 = xq[2][b].qs + o, *x3 = xq[3][b].qs + o;
+        const uint8_t *bl = w + (size_t)s * MXFP4_BSIZE;
+        int8x16_t lo, hi;
+        unpack_mxfp4(bl + 1, &lo, &hi);
+        float d = e8m0_to_fp32_half(bl[0]);
+        int32x4_t a0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, vld1q_s8(x0)), hi, vld1q_s8(x0 + 16));
+        int32x4_t a1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, vld1q_s8(x1)), hi, vld1q_s8(x1 + 16));
+        int32x4_t a2 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, vld1q_s8(x2)), hi, vld1q_s8(x2 + 16));
+        int32x4_t a3 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, vld1q_s8(x3)), hi, vld1q_s8(x3 + 16));
+        t0 += xq[0][b].scale * d * (float)vaddvq_s32(a0);
+        t1 += xq[1][b].scale * d * (float)vaddvq_s32(a1);
+        t2 += xq[2][b].scale * d * (float)vaddvq_s32(a2);
+        t3 += xq[3][b].scale * d * (float)vaddvq_s32(a3);
+    }
+    out[0] = t0; out[1] = t1; out[2] = t2; out[3] = t3;
+}
+
+/* ═══ Q8_0 × Q8 fused kernel (34-byte blocks: f16 scale + 32 int8) ═══ */
+
+#define Q80_BSIZE 34
+
+static float dot_q80_q8(const uint8_t *w, const q8_block *xq, int ncols) {
+    int n_sub = ncols / 32;
+    float total = 0;
+    for (int s = 0; s < n_sub; s++) {
+        const q8_block *xb = &xq[s >> 3];
+        const int8_t *xqs = xb->qs + (s & 7) * 32;
+        const uint8_t *bl = w + (size_t)s * Q80_BSIZE;
+        uint16_t dr; memcpy(&dr, bl, 2);
+        const int8_t *q = (const int8_t *)(bl + 2);
+        int32x4_t acc = vdotq_s32(vdupq_n_s32(0), vld1q_s8(q), vld1q_s8(xqs));
+        acc = vdotq_s32(acc, vld1q_s8(q + 16), vld1q_s8(xqs + 16));
+        total += xb->scale * f16_to_f32(dr) * (float)vaddvq_s32(acc);
+    }
+    return total;
+}
+
+/* ═══ Format dispatch ═══ */
+
+enum { TG_FMT_Q4K = 0, TG_FMT_F16 = 1, TG_FMT_Q6K = 2, TG_FMT_MXFP4 = 3, TG_FMT_Q80 = 4 };
+
+static inline size_t fmt_row_bytes(int fmt, int ncols) {
+    switch (fmt) {
+        case TG_FMT_Q4K:   return (size_t)(ncols / QK_K) * Q4K_BSIZE;
+        case TG_FMT_Q6K:   return (size_t)(ncols / QK_K) * Q6K_BSIZE;
+        case TG_FMT_MXFP4: return (size_t)(ncols / 32) * MXFP4_BSIZE;
+        case TG_FMT_Q80:   return (size_t)(ncols / 32) * Q80_BSIZE;
+        default:           return (size_t)ncols * 2;
+    }
+}
+
+size_t tg_row_bytes(int fmt, int ncols) { return fmt_row_bytes(fmt, ncols); }
+
+static void matvec_f16(const uint16_t *A, const float *x, float *out, int nrows, int ncols);
+
+/* One weight row against one quantized input (x_f32 only used by the f16 format). */
+static inline float dot_fmt(int fmt, const uint8_t *row, const q8_block *xq,
+                            const float *x_f32, int ncols) {
+    switch (fmt) {
+        case TG_FMT_Q4K:   return dot_q4k_q8(row, xq, ncols / QK_K);
+        case TG_FMT_Q6K:   return dot_q6k_q8(row, xq, ncols / QK_K);
+        case TG_FMT_MXFP4: return dot_mxfp4_q8(row, xq, ncols);
+        case TG_FMT_Q80:   return dot_q80_q8(row, xq, ncols);
+        default: { float o; matvec_f16((const uint16_t *)row, x_f32, &o, 1, ncols); return o; }
+    }
+}
+
+static inline void dot_fmt_x4(int fmt, const uint8_t *row, const q8_block *const xq[4],
+                              const float *const x_f32[4], int ncols, float out[4]) {
+    switch (fmt) {
+        case TG_FMT_Q4K:   dot_q4k_q8_x4(row, xq, ncols / QK_K, out); return;
+        case TG_FMT_Q6K:   dot_q6k_q8_x4(row, xq, ncols / QK_K, out); return;
+        case TG_FMT_MXFP4: dot_mxfp4_q8_x4(row, xq, ncols, out); return;
+        default:
+            for (int r = 0; r < 4; r++) out[r] = dot_fmt(fmt, row, xq[r], x_f32 ? x_f32[r] : NULL, ncols);
+    }
 }
 
 /* ═══ f16 matrix-vector multiply ═══ */
@@ -677,30 +816,36 @@ void tg_attention_decode(
 /* ═══ GQA Attention Decode Step (Q4_K weights) ═══ */
 
 typedef struct {
-    const uint8_t *wq, *wk;
-    const uint16_t *wv;
+    const uint8_t *wq, *wk, *wv;
+    int fmt_q, fmt_k, fmt_v;
+    const float *bq, *bk, *bv;     /* nullable */
     const q8_block *xq;
     const float *input;
     float *q, *k, *v;
-    int q_dim, kv_dim, embed_dim, bpr;
+    int q_dim, kv_dim, embed_dim;
     int n_q_chunks, n_k_chunks;
 } qkv_ctx;
+
+static void qkv_rows(int fmt, const uint8_t *w, const float *bias, const q8_block *xq,
+                     const float *input, float *out, int r0, int r1, int ncols) {
+    size_t rb = fmt_row_bytes(fmt, ncols);
+    for (int r = r0; r < r1; r++)
+        out[r] = dot_fmt(fmt, w + (size_t)r * rb, xq, input, ncols) + (bias ? bias[r] : 0.f);
+}
 
 static void qkv_task(void *p, size_t i) {
     qkv_ctx *c = p;
     if ((int)i < c->n_q_chunks) {
         int r0 = (int)i * MM_CHUNK, r1 = r0 + MM_CHUNK < c->q_dim ? r0 + MM_CHUNK : c->q_dim;
-        for (int r = r0; r < r1; r++)
-            c->q[r] = dot_q4k_q8(c->wq + (size_t)r * c->bpr * Q4K_BSIZE, c->xq, c->bpr);
+        qkv_rows(c->fmt_q, c->wq, c->bq, c->xq, c->input, c->q, r0, r1, c->embed_dim);
     } else if ((int)i < c->n_q_chunks + c->n_k_chunks) {
         int r0 = ((int)i - c->n_q_chunks) * MM_CHUNK;
         int r1 = r0 + MM_CHUNK < c->kv_dim ? r0 + MM_CHUNK : c->kv_dim;
-        for (int r = r0; r < r1; r++)
-            c->k[r] = dot_q4k_q8(c->wk + (size_t)r * c->bpr * Q4K_BSIZE, c->xq, c->bpr);
+        qkv_rows(c->fmt_k, c->wk, c->bk, c->xq, c->input, c->k, r0, r1, c->embed_dim);
     } else {
         int r0 = ((int)i - c->n_q_chunks - c->n_k_chunks) * MM_CHUNK;
         int r1 = r0 + MM_CHUNK < c->kv_dim ? r0 + MM_CHUNK : c->kv_dim;
-        matvec_f16(c->wv + (size_t)r0 * c->embed_dim, c->input, c->v + r0, r1 - r0, c->embed_dim);
+        qkv_rows(c->fmt_v, c->wv, c->bv, c->xq, c->input, c->v, r0, r1, c->embed_dim);
     }
 }
 
@@ -710,19 +855,21 @@ typedef struct {
     float *out;
     int seq_len, kv_max, head_dim, gqa_ratio;
     float inv_sqrt;
+    int start;             /* first attended position (sliding window) */
+    const float *sinks;    /* per-head attention sink logits, or NULL */
 } head_ctx;
 
 static void head_task(void *p, size_t h) {
     head_ctx *c = p;
-    int head_dim = c->head_dim, seq_len = c->seq_len;
+    int head_dim = c->head_dim, seq_len = c->seq_len, start = c->start;
     int kv_h = (int)h / c->gqa_ratio;
     const float *q_h = c->q + h * head_dim;
     const float *k_cache = c->kv_k + (size_t)kv_h * c->kv_max * head_dim;
     const float *v_cache = c->kv_v + (size_t)kv_h * c->kv_max * head_dim;
 
-    float scores[seq_len];
-    float max_score = -1e30f;
-    for (int t = 0; t < seq_len; t++) {
+    float scores[seq_len - start];
+    float max_score = c->sinks ? c->sinks[h] : -1e30f;
+    for (int t = start; t < seq_len; t++) {
         float32x4_t acc = vdupq_n_f32(0);
         const float *kt = k_cache + (size_t)t * head_dim;
         int d = 0;
@@ -730,20 +877,20 @@ static void head_task(void *p, size_t h) {
             acc = vfmaq_f32(acc, vld1q_f32(q_h + d), vld1q_f32(kt + d));
         float dot = vaddvq_f32(acc);
         for (; d < head_dim; d++) dot += q_h[d] * kt[d];
-        scores[t] = dot * c->inv_sqrt;
-        if (scores[t] > max_score) max_score = scores[t];
+        scores[t - start] = dot * c->inv_sqrt;
+        if (scores[t - start] > max_score) max_score = scores[t - start];
     }
-    float sum_exp = 0;
-    for (int t = 0; t < seq_len; t++) {
-        scores[t] = expf(scores[t] - max_score);
-        sum_exp += scores[t];
+    float sum_exp = c->sinks ? expf(c->sinks[h] - max_score) : 0.f;
+    for (int t = start; t < seq_len; t++) {
+        scores[t - start] = expf(scores[t - start] - max_score);
+        sum_exp += scores[t - start];
     }
     float inv_sum = 1.f / sum_exp;
 
     float *out_h = c->out + h * head_dim;
     memset(out_h, 0, head_dim * sizeof(float));
-    for (int t = 0; t < seq_len; t++) {
-        float w = scores[t] * inv_sum;
+    for (int t = start; t < seq_len; t++) {
+        float w = scores[t - start] * inv_sum;
         const float *vt = v_cache + (size_t)t * head_dim;
         float32x4_t vw = vdupq_n_f32(w);
         int d = 0;
@@ -754,6 +901,85 @@ static void head_task(void *p, size_t h) {
         }
         for (; d < head_dim; d++) out_h[d] += w * vt[d];
     }
+}
+
+/* ═══ Generic threaded matvec (any weight format) ═══ */
+
+typedef struct {
+    int fmt;
+    const uint8_t *mat;
+    const q8_block *xq;
+    const float *input;
+    const float *bias;
+    float *out;
+    int nrows, ncols;
+} gmm_ctx;
+
+static void gmm_task(void *p, size_t i) {
+    gmm_ctx *c = p;
+    int r0 = (int)(i * MM_CHUNK);
+    int r1 = r0 + MM_CHUNK < c->nrows ? r0 + MM_CHUNK : c->nrows;
+    qkv_rows(c->fmt, c->mat, c->bias, c->xq, c->input, c->out, r0, r1, c->ncols);
+}
+
+void tg_matmul(int fmt, const void *mat, const float *bias, const float *input,
+               float *output, int nrows, int ncols) {
+    q8_block xq[Q8_NBLOCKS(ncols)];
+    if (fmt != TG_FMT_F16) quantize_q8(input, xq, ncols);
+    gmm_ctx c = { fmt, mat, xq, input, bias, output, nrows, ncols };
+    tg_parallel_for((nrows + MM_CHUNK - 1) / MM_CHUNK, gmm_task, &c);
+}
+
+/* ═══ Generic attention decode step ═══
+ *
+ * Any weight format per projection, optional biases, optional QK RMS norm
+ * (pass NULL norm weights to skip), optional attention sinks, and a sliding
+ * window (0 = full attention).
+ */
+void tg_attention_v2(
+    int fmt_q, int fmt_k, int fmt_v, int fmt_o,
+    const void *wq, const void *wk, const void *wv, const void *wo,
+    const float *bq, const float *bk, const float *bv, const float *bo,
+    const float *q_norm_w, const float *k_norm_w, const float *sinks,
+    float *kv_k, float *kv_v, int kv_len, int kv_max, int window,
+    const float *rope_cos, const float *rope_sin,
+    const float *input, float *output,
+    int embed_dim, int n_heads, int n_kv_heads, int head_dim, int pos, float eps)
+{
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int gqa_ratio = n_heads / n_kv_heads;
+
+    float q[q_dim], k[kv_dim], v[kv_dim];
+    q8_block xq[Q8_NBLOCKS(embed_dim)];
+    quantize_q8(input, xq, embed_dim);
+    qkv_ctx qc = { wq, wk, wv, fmt_q, fmt_k, fmt_v, bq, bk, bv, xq, input, q, k, v,
+                   q_dim, kv_dim, embed_dim,
+                   (q_dim + MM_CHUNK - 1) / MM_CHUNK, (kv_dim + MM_CHUNK - 1) / MM_CHUNK };
+    tg_parallel_for((size_t)qc.n_q_chunks + 2 * qc.n_k_chunks, qkv_task, &qc);
+
+    if (q_norm_w) {
+        for (int h = 0; h < n_heads; h++)
+            tg_rms_norm(q + h * head_dim, q_norm_w, q + h * head_dim, head_dim, eps);
+        for (int h = 0; h < n_kv_heads; h++)
+            tg_rms_norm(k + h * head_dim, k_norm_w, k + h * head_dim, head_dim, eps);
+    }
+    apply_rope_inplace(q, n_heads, head_dim, rope_cos, rope_sin, pos);
+    apply_rope_inplace(k, n_kv_heads, head_dim, rope_cos, rope_sin, pos);
+
+    for (int h = 0; h < n_kv_heads; h++) {
+        memcpy(kv_k + ((size_t)h * kv_max + kv_len) * head_dim, k + h * head_dim, head_dim * sizeof(float));
+        memcpy(kv_v + ((size_t)h * kv_max + kv_len) * head_dim, v + h * head_dim, head_dim * sizeof(float));
+    }
+
+    int seq_len = kv_len + 1;
+    int start = (window > 0 && seq_len > window) ? seq_len - window : 0;
+    float attn_out[q_dim];
+    head_ctx hc = { q, kv_k, kv_v, attn_out, seq_len, kv_max, head_dim, gqa_ratio,
+                    1.f / sqrtf((float)head_dim), start, sinks };
+    tg_parallel_for(n_heads, head_task, &hc);
+
+    tg_matmul(fmt_o, wo, bo, attn_out, output, embed_dim, q_dim);
 }
 
 void tg_attention_decode_q4(
@@ -774,8 +1000,9 @@ void tg_attention_decode_q4(
 
     /* Q/K/V projections in one dispatch (shared Q8 input) */
     q8_block xq[bpr];
-    quantize_q8(input, xq, bpr);
-    qkv_ctx qc = { wq_q4, wk_q4, wv_f16, xq, input, q, k, v, q_dim, kv_dim, embed_dim, bpr,
+    quantize_q8(input, xq, embed_dim);
+    qkv_ctx qc = { wq_q4, wk_q4, (const uint8_t *)wv_f16, TG_FMT_Q4K, TG_FMT_Q4K, TG_FMT_F16,
+                   NULL, NULL, NULL, xq, input, q, k, v, q_dim, kv_dim, embed_dim,
                    (q_dim + MM_CHUNK - 1) / MM_CHUNK, (kv_dim + MM_CHUNK - 1) / MM_CHUNK };
     tg_parallel_for((size_t)qc.n_q_chunks + 2 * qc.n_k_chunks, qkv_task, &qc);
 
@@ -801,7 +1028,7 @@ void tg_attention_decode_q4(
     /* GQA attention, one task per head */
     float attn_out[q_dim];
     head_ctx hc = { q_normed, kv_k, kv_v, attn_out, kv_len + 1, kv_max, head_dim, gqa_ratio,
-                    1.f / sqrtf((float)head_dim) };
+                    1.f / sqrtf((float)head_dim), 0, NULL };
     tg_parallel_for(n_heads, head_task, &hc);
 
     /* Output projection via fused Q4×Q8 */
@@ -822,7 +1049,7 @@ void tg_expert_forward(const uint8_t *q4_data, const float *input,
     const uint8_t *down = q4_data + 2 * gate_bytes;
 
     q8_block xq_embed[gate_bpr];
-    quantize_q8(input, xq_embed, gate_bpr);
+    quantize_q8(input, xq_embed, embed_dim);
 
     float gate_out[inter_dim];
     for (int r = 0; r < inter_dim; r++)
@@ -841,7 +1068,7 @@ void tg_expert_forward(const uint8_t *q4_data, const float *input,
     }
 
     q8_block xq_inter[down_bpr];
-    quantize_q8(hidden, xq_inter, down_bpr);
+    quantize_q8(hidden, xq_inter, inter_dim);
 
     float down_out[embed_dim];
     for (int r = 0; r < embed_dim; r++)
@@ -864,7 +1091,7 @@ void tg_expert_forward_mixed(
     int down_bpr = inter_dim / QK_K;
 
     q8_block xq_embed[gate_bpr];
-    quantize_q8(input, xq_embed, gate_bpr);
+    quantize_q8(input, xq_embed, embed_dim);
 
     float gate_out[inter_dim];
     for (int r = 0; r < inter_dim; r++)
@@ -889,7 +1116,7 @@ void tg_expert_forward_mixed(
         matmul_q6k((const uint8_t *)down_data, hidden, down_out, embed_dim, inter_dim);
     } else {
         q8_block xq_inter[down_bpr];
-        quantize_q8(hidden, xq_inter, down_bpr);
+        quantize_q8(hidden, xq_inter, inter_dim);
         for (int r = 0; r < embed_dim; r++)
             down_out[r] = dot_q4k_q8((const uint8_t *)down_data +
                                       (size_t)r * down_bpr * Q4K_BSIZE,
@@ -968,7 +1195,7 @@ void tg_expert_forward_rows(
     float *down_out = malloc(sizeof(float) * embed_dim * k);
 
     for (int r = 0; r < k; r++)
-        quantize_q8(inputs + (size_t)r * embed_dim, xq_embed + (size_t)r * gate_bpr, gate_bpr);
+        quantize_q8(inputs + (size_t)r * embed_dim, xq_embed + (size_t)r * gate_bpr, embed_dim);
 
     q4k_rows(gate_q4, inter_dim, gate_bpr, xq_embed, k, gate_bpr, gate_out, inter_dim);
     q4k_rows(up_q4,   inter_dim, gate_bpr, xq_embed, k, gate_bpr, up_out,   inter_dim);
@@ -985,7 +1212,7 @@ void tg_expert_forward_rows(
     } else {
         q8_block *xq_inter = malloc(sizeof(q8_block) * down_bpr * k);
         for (int r = 0; r < k; r++)
-            quantize_q8(hidden + (size_t)r * inter_dim, xq_inter + (size_t)r * down_bpr, down_bpr);
+            quantize_q8(hidden + (size_t)r * inter_dim, xq_inter + (size_t)r * down_bpr, inter_dim);
         if (down_format == 2)
             q6k_rows(down_data, embed_dim, down_bpr, xq_inter, k, down_bpr, down_out, embed_dim);
         else
@@ -1018,11 +1245,27 @@ void tg_expert_forward_rows(
 #define MOE_INTER_CHUNK 96
 #define MOE_EMBED_CHUNK 256
 
+enum { TG_ACT_SILU = 0, TG_ACT_GPTOSS = 1 };
+
+static inline float act_fn(int act, float g, float u) {
+    if (act == TG_ACT_GPTOSS) {
+        if (g > 7.f) g = 7.f;
+        if (u > 7.f) u = 7.f; else if (u < -7.f) u = -7.f;
+        return g / (1.f + expf(-1.702f * g)) * (u + 1.f);
+    }
+    return g / (1.f + expf(-g)) * u;
+}
+
 typedef struct {
     const uint8_t *const *gate_ptrs;
     const uint8_t *const *up_ptrs;
     const void *const *down_ptrs;
+    int gate_fmt;
     const int *down_fmts;
+    const float *const *gate_bias;   /* per expert [inter_dim] or NULL */
+    const float *const *up_bias;
+    const float *const *down_bias;   /* per expert [embed_dim] or NULL */
+    int act;
     int n_experts, k, embed_dim, inter_dim, gate_bpr, down_bpr;
     int *n_rows;        /* [n_experts] */
     int *rows;          /* [n_experts][k] */
@@ -1041,11 +1284,15 @@ static void moe_phase_a(void *p, size_t task) {
     if (n == 0) return;
     int r0 = ch * MOE_INTER_CHUNK;
     int r1 = r0 + MOE_INTER_CHUNK < c->inter_dim ? r0 + MOE_INTER_CHUNK : c->inter_dim;
-    size_t gate_row = (size_t)c->gate_bpr * Q4K_BSIZE;
+    int fmt = c->gate_fmt;
+    size_t gate_row = fmt_row_bytes(fmt, c->embed_dim);
     const uint8_t *gate = c->gate_ptrs[e] + r0 * gate_row;
     const uint8_t *up   = c->up_ptrs[e] + r0 * gate_row;
     const q8_block *xq = c->xq_in + (size_t)e * c->k * c->gate_bpr;
+    const float *gb = c->gate_bias ? c->gate_bias[e] : NULL;
+    const float *ub = c->up_bias ? c->up_bias[e] : NULL;
     float *hid = c->hidden + (size_t)e * c->k * c->inter_dim;
+    int D = c->embed_dim;
 
     float g[MOE_INTER_CHUNK * 4], u[MOE_INTER_CHUNK * 4];
     for (int b = 0; b < n; b += 4) {
@@ -1054,9 +1301,10 @@ static void moe_phase_a(void *p, size_t task) {
             const q8_block *x = xq + (size_t)b * c->gate_bpr;
             float *h = hid + (size_t)b * c->inter_dim;
             for (int r = r0; r < r1; r++) {
-                float gv = dot_q4k_q8(gate + (size_t)(r - r0) * gate_row, x, c->gate_bpr);
-                float uv = dot_q4k_q8(up + (size_t)(r - r0) * gate_row, x, c->gate_bpr);
-                h[r] = gv / (1.f + expf(-gv)) * uv;
+                float gv = dot_fmt(fmt, gate + (size_t)(r - r0) * gate_row, x, NULL, D);
+                float uv = dot_fmt(fmt, up + (size_t)(r - r0) * gate_row, x, NULL, D);
+                if (gb) { gv += gb[r]; uv += ub[r]; }
+                h[r] = act_fn(c->act, gv, uv);
             }
             continue;
         }
@@ -1064,14 +1312,15 @@ static void moe_phase_a(void *p, size_t task) {
         for (int j = 0; j < 4; j++)
             px[j] = xq + (size_t)(b + (j < m ? j : m - 1)) * c->gate_bpr;
         for (int r = r0; r < r1; r++) {
-            dot_q4k_q8_x4(gate + (size_t)(r - r0) * gate_row, px, c->gate_bpr, g + (r - r0) * 4);
-            dot_q4k_q8_x4(up + (size_t)(r - r0) * gate_row, px, c->gate_bpr, u + (r - r0) * 4);
+            dot_fmt_x4(fmt, gate + (size_t)(r - r0) * gate_row, px, NULL, D, g + (r - r0) * 4);
+            dot_fmt_x4(fmt, up + (size_t)(r - r0) * gate_row, px, NULL, D, u + (r - r0) * 4);
         }
         for (int j = 0; j < m; j++) {
             float *h = hid + (size_t)(b + j) * c->inter_dim;
             for (int r = r0; r < r1; r++) {
-                float gv = g[(r - r0) * 4 + j];
-                h[r] = gv / (1.f + expf(-gv)) * u[(r - r0) * 4 + j];
+                float gv = g[(r - r0) * 4 + j], uv = u[(r - r0) * 4 + j];
+                if (gb) { gv += gb[r]; uv += ub[r]; }
+                h[r] = act_fn(c->act, gv, uv);
             }
         }
     }
@@ -1088,24 +1337,27 @@ static void moe_phase_b(void *p, size_t task) {
     const float *hid = c->hidden + (size_t)e * c->k * c->inter_dim;
     float *part = c->partials + (size_t)e * c->k * c->embed_dim;
     const float *wt = c->wts + (size_t)e * c->k;
+    const float *db = c->down_bias ? c->down_bias[e] : NULL;
     int fmt = c->down_fmts[e];
     const void *down = c->down_ptrs[e];
+    int I = c->inter_dim;
 
-    if (fmt == 1) {
+    if (fmt == TG_FMT_F16) {
         const uint16_t *w = (const uint16_t *)down;
         for (int j = 0; j < n; j++)
-            matvec_f16(w + (size_t)r0 * c->inter_dim, hid + (size_t)j * c->inter_dim,
-                       part + (size_t)j * c->embed_dim + r0, r1 - r0, c->inter_dim);
+            matvec_f16(w + (size_t)r0 * I, hid + (size_t)j * I,
+                       part + (size_t)j * c->embed_dim + r0, r1 - r0, I);
         for (int j = 0; j < n; j++)
-            for (int r = r0; r < r1; r++) part[(size_t)j * c->embed_dim + r] *= wt[j];
+            for (int r = r0; r < r1; r++)
+                part[(size_t)j * c->embed_dim + r] = wt[j] * (part[(size_t)j * c->embed_dim + r] + (db ? db[r] : 0.f));
         return;
     }
 
-    size_t row_bytes = (size_t)c->down_bpr * (fmt == 2 ? Q6K_BSIZE : Q4K_BSIZE);
+    size_t row_bytes = fmt_row_bytes(fmt, I);
     const uint8_t *mat = (const uint8_t *)down + r0 * row_bytes;
     q8_block xq[n * c->down_bpr];
     for (int j = 0; j < n; j++)
-        quantize_q8(hid + (size_t)j * c->inter_dim, xq + (size_t)j * c->down_bpr, c->down_bpr);
+        quantize_q8(hid + (size_t)j * I, xq + (size_t)j * c->down_bpr, I);
 
     for (int b = 0; b < n; b += 4) {
         int m = n - b < 4 ? n - b : 4;
@@ -1113,9 +1365,8 @@ static void moe_phase_b(void *p, size_t task) {
             const q8_block *x = xq + (size_t)b * c->down_bpr;
             float *o = part + (size_t)b * c->embed_dim;
             for (int r = r0; r < r1; r++) {
-                const uint8_t *wr = mat + (size_t)(r - r0) * row_bytes;
-                float v = fmt == 2 ? dot_q6k_q8(wr, x, c->down_bpr) : dot_q4k_q8(wr, x, c->down_bpr);
-                o[r] = wt[b] * v;
+                float v = dot_fmt(fmt, mat + (size_t)(r - r0) * row_bytes, x, NULL, I);
+                o[r] = wt[b] * (v + (db ? db[r] : 0.f));
             }
             continue;
         }
@@ -1124,23 +1375,25 @@ static void moe_phase_b(void *p, size_t task) {
             px[j] = xq + (size_t)(b + (j < m ? j : m - 1)) * c->down_bpr;
         for (int r = r0; r < r1; r++) {
             float o[4];
-            const uint8_t *wr = mat + (size_t)(r - r0) * row_bytes;
-            if (fmt == 2) dot_q6k_q8_x4(wr, px, c->down_bpr, o);
-            else          dot_q4k_q8_x4(wr, px, c->down_bpr, o);
+            dot_fmt_x4(fmt, mat + (size_t)(r - r0) * row_bytes, px, NULL, I, o);
+            float bias = db ? db[r] : 0.f;
             for (int j = 0; j < m; j++)
-                part[(size_t)(b + j) * c->embed_dim + r] = wt[b + j] * o[j];
+                part[(size_t)(b + j) * c->embed_dim + r] = wt[b + j] * (o[j] + bias);
         }
     }
 }
 
-void tg_moe_forward_rows(
+void tg_moe_forward_rows_v2(
     const uint8_t *const *gate_ptrs, const uint8_t *const *up_ptrs,
-    const void *const *down_ptrs, const int *down_fmts, int n_experts,
+    const void *const *down_ptrs, int gate_fmt, const int *down_fmts,
+    const float *const *gate_bias, const float *const *up_bias, const float *const *down_bias,
+    int act, int n_experts,
     const float *row_weights, const float *inputs, float *output, int k,
     int embed_dim, int inter_dim)
 {
-    int gate_bpr = embed_dim / QK_K, down_bpr = inter_dim / QK_K;
-    moe_ctx c = { gate_ptrs, up_ptrs, down_ptrs, down_fmts,
+    int gate_bpr = Q8_NBLOCKS(embed_dim), down_bpr = Q8_NBLOCKS(inter_dim);
+    moe_ctx c = { gate_ptrs, up_ptrs, down_ptrs, gate_fmt, down_fmts,
+                  gate_bias, up_bias, down_bias, act,
                   n_experts, k, embed_dim, inter_dim, gate_bpr, down_bpr };
     c.n_rows = calloc(n_experts, sizeof(int));
     c.rows = malloc(sizeof(int) * n_experts * k);
@@ -1154,7 +1407,7 @@ void tg_moe_forward_rows(
     /* Quantize each batch row once, then point each expert's active rows at it. */
     q8_block *xq_rows = malloc(sizeof(q8_block) * (size_t)k * gate_bpr);
     for (int r = 0; r < k; r++)
-        quantize_q8(inputs + (size_t)r * embed_dim, xq_rows + (size_t)r * gate_bpr, gate_bpr);
+        quantize_q8(inputs + (size_t)r * embed_dim, xq_rows + (size_t)r * gate_bpr, embed_dim);
     for (int e = 0; e < n_experts; e++) {
         const float *w = row_weights + (size_t)e * k;
         int n = 0;
@@ -1181,6 +1434,17 @@ void tg_moe_forward_rows(
     }
     free(xq_rows); free(c.n_rows); free(c.rows); free(c.wts);
     free(c.xq_in); free(c.hidden); free(c.partials);
+}
+
+void tg_moe_forward_rows(
+    const uint8_t *const *gate_ptrs, const uint8_t *const *up_ptrs,
+    const void *const *down_ptrs, const int *down_fmts, int n_experts,
+    const float *row_weights, const float *inputs, float *output, int k,
+    int embed_dim, int inter_dim)
+{
+    tg_moe_forward_rows_v2(gate_ptrs, up_ptrs, down_ptrs, TG_FMT_Q4K, down_fmts,
+                           NULL, NULL, NULL, TG_ACT_SILU, n_experts,
+                           row_weights, inputs, output, k, embed_dim, inter_dim);
 }
 
 /* ═══ Batch expert forward ═══ */

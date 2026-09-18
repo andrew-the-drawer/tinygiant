@@ -16,9 +16,18 @@ MAGIC = b"NWSMOE01"
 Q4K_BSIZE = 144
 Q6K_BSIZE = 210
 QK_K = 256
-BLOCK_SIZES = {12: Q4K_BSIZE, 14: Q6K_BSIZE}
+GGML_Q8_0 = 8
 GGML_Q4_K = 12
 GGML_Q6_K = 14
+GGML_MXFP4 = 39
+# ggml type -> (bytes per block, values per block, format name)
+QUANT_TYPES = {
+    GGML_Q4_K: (Q4K_BSIZE, QK_K, "q4_k"),
+    GGML_Q6_K: (Q6K_BSIZE, QK_K, "q6_k"),
+    GGML_MXFP4: (17, 32, "mxfp4"),
+    GGML_Q8_0: (34, 32, "q8_0"),
+}
+BLOCK_SIZES = {k: v[0] for k, v in QUANT_TYPES.items()}
 
 
 def analyze_model(reader):
@@ -92,14 +101,14 @@ def compute_q4_expert_sizes(tensor_map, layer_idx):
         name = f"blk.{layer_idx}.{suffix}"
         t = tensor_map[name]
         qtype = int(t.tensor_type)
-        bsize = BLOCK_SIZES.get(qtype, Q4K_BSIZE)
+        bsize, elems, _ = QUANT_TYPES.get(qtype, QUANT_TYPES[GGML_Q4_K])
         data_shape = list(t.data.shape)
         n_experts = data_shape[0]
         out_dim = data_shape[1]
         bytes_per_row = data_shape[2]
         expert_bytes = out_dim * bytes_per_row
         bpr = bytes_per_row // bsize
-        in_dim = bpr * QK_K
+        in_dim = bpr * elems
         sizes[key] = {
             "n_experts": n_experts, "out_dim": out_dim, "in_dim": in_dim,
             "bpr": bpr, "expert_bytes": expert_bytes,
@@ -119,14 +128,10 @@ def extract_experts_q4(tensor_map, layer_idx, n_experts):
         qtype = int(t.tensor_type)
         expert_bytes = sizes[key]["expert_bytes"]
 
-        if qtype == GGML_Q4_K:
-            print(f"    {key}: Q4_K raw, {t.n_bytes/1024**2:.0f} MB"
+        if qtype in QUANT_TYPES:
+            formats[key] = QUANT_TYPES[qtype][2]
+            print(f"    {key}: {formats[key]} raw, {t.n_bytes/1024**2:.0f} MB"
                   f" -> {n_experts} x {expert_bytes/1024:.0f} KB")
-            formats[key] = "q4_k"
-        elif qtype == GGML_Q6_K:
-            print(f"    {key}: Q6_K raw, {t.n_bytes/1024**2:.0f} MB"
-                  f" -> {n_experts} x {expert_bytes/1024:.0f} KB")
-            formats[key] = "q6_k"
         else:
             raise ValueError(f"Unsupported quant type {qtype} for {name}")
 
@@ -180,7 +185,7 @@ def profile_activation(tensor_map, n_layers, n_experts, top_k=8, n_samples=1000)
     np.random.seed(42)
     embed_dim = None
     for name in tensor_map:
-        if "ffn_gate_inp" in name:
+        if name.endswith("ffn_gate_inp.weight"):
             t = tensor_map[name]
             shape = [int(x) for x in t.shape]
             embed_dim = shape[0]
@@ -195,8 +200,11 @@ def profile_activation(tensor_map, n_layers, n_experts, top_k=8, n_samples=1000)
         if name not in tensor_map:
             continue
         t = tensor_map[name]
-        router = np.frombuffer(t.data, dtype=np.float32).reshape([int(x) for x in t.shape])
-        logits = inputs @ router
+        router = np.asarray(t.data, dtype=np.float32).reshape(n_experts, embed_dim)
+        logits = inputs @ router.T
+        bias_name = f"blk.{layer_idx}.ffn_gate_inp.bias"
+        if bias_name in tensor_map:
+            logits = logits + np.asarray(tensor_map[bias_name].data, dtype=np.float32).reshape(-1)
         top_indices = np.argsort(logits, axis=1)[:, -top_k:]
         counts = np.zeros(n_experts, dtype=int)
         for i in range(n_samples):
@@ -253,11 +261,14 @@ def main():
         layer_indices = list(range(n_layers))
 
     shapes = get_expert_shapes(tensor_map, layer_indices[0])
-    per_expert_bytes = sum(
-        np.prod([s for s in info["shape"][:2]]) * 2
-        for info in shapes.values()
-    )
-    print(f"\n  Per expert (float16): {per_expert_bytes / 1024:.0f} KB")
+    if args.format == "q4":
+        per_expert_bytes = sum(v["expert_bytes"] for v in compute_q4_expert_sizes(tensor_map, layer_indices[0]).values())
+    else:
+        per_expert_bytes = sum(
+            np.prod([s for s in info["shape"][:2]]) * 2
+            for info in shapes.values()
+        )
+    print(f"\n  Per expert ({args.format}): {per_expert_bytes / 1024:.0f} KB")
     print(f"  Per layer (all experts): {per_expert_bytes * n_experts / 1024**2:.0f} MB")
     print(f"  Selected layers: {len(layer_indices)}")
     print(f"  Estimated output: {per_expert_bytes * n_experts * len(layer_indices) / 1024**3:.1f} GB")
@@ -282,7 +293,7 @@ def main():
         "n_experts": n_experts,
         "n_experts_used": arch["n_experts_used"],
         "embed_dim": arch["embed_dim"],
-        "dtype": "q4_k" if use_q4 else "float16",
+        "dtype": "quant" if use_q4 else "float16",
         "expert_shapes": shapes,
         "layers": {},
         "activation_profile": activation_profile,

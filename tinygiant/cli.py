@@ -18,7 +18,7 @@ def _detokenize(tok, tokens):
 
 
 def cmd_generate():
-    from ._constants import N_LAYERS
+
     from .engine import NWSEngine
 
     parser = argparse.ArgumentParser(
@@ -44,7 +44,7 @@ def cmd_generate():
     with open(os.path.join(cache_dir, "index.json")) as f:
         idx = json.load(f)
     cached_layers = sorted(int(k) for k in idx["layers"].keys())
-    missing = [i for i in range(N_LAYERS) if i not in cached_layers]
+    missing = [i for i in range(int(idx["n_layers"])) if i not in cached_layers]
     if missing:
         print(f"ERROR: Missing layers in cache: {missing}")
         print("Run 'tinygiant-relayout' first.")

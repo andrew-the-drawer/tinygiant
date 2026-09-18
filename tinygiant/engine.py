@@ -8,20 +8,18 @@ import numpy as np
 from gguf import GGUFReader
 from gguf.quants import dequantize as gguf_dequantize
 
-from ._constants import (
-    EMBED_DIM, EXPERT_INTERMEDIATE, HEAD_DIM, N_EXPERTS, N_EXPERTS_USED,
-    N_HEADS, N_KV_HEADS, N_LAYERS, RMS_EPS, VOCAB_SIZE,
-)
 from ._lib import load_tinygiant_lib
-from ._math import build_rope_cache
 from .cache import ExpertCache
 from .iosched import PRIO_DRAFT, PRIO_LOOKAHEAD, PRIO_TOKEN_PRIOR
 from .predict import LookaheadPredictor
 from .router import Router, RoutingConfig
+from .spec import ModelSpec
 from .specdec import SpecStats, dist, generate_spec, sample
 
-GGML_Q4_K = 12
-GGML_Q6_K = 14
+# ggml tensor type -> libtinygiant format code
+FMT_CODES = {12: 0, 1: 1, 14: 2, 39: 3, 8: 4}
+FMT_NAMES = {"q4_k": 0, "float16": 1, "q6_k": 2, "mxfp4": 3, "q8_0": 4}
+ACT_CODES = {"silu": 0, "gptoss": 1}
 
 
 def _dequant(tensor):
@@ -58,11 +56,15 @@ class NWSEngine:
 
         self.reader = GGUFReader(model_path)
         self.tensor_map = {t.name: t for t in self.reader.tensors}
+        self.spec = S = ModelSpec.from_gguf(self.reader)
+        self._say(f"Model: {S.arch}, {S.n_layers} layers, {S.n_experts}x{S.n_experts_used} experts, "
+                  f"d={S.embed_dim}, heads {S.n_heads}/{S.n_kv_heads}x{S.head_dim}, "
+                  f"window {S.sliding_window or '-'}, act {S.activation}")
 
         with open(os.path.join(cache_dir, "index.json")) as f:
             self.cache_index = json.load(f)
-        if self.cache_index.get("dtype") != "q4_k":
-            raise RuntimeError("Only the q4 expert cache is supported (rebuild with --format q4)")
+        if self.cache_index.get("dtype") not in ("q4_k", "quant"):
+            raise RuntimeError("Only the quantized expert cache is supported (rebuild with --format q4)")
 
         self.lib = load_tinygiant_lib(lib_path)
         if self.lib is None:
@@ -74,62 +76,61 @@ class NWSEngine:
                                         cold_budget_mb=cold_budget_mb, io_threads=io_threads)
         self.expert_cache.set_lib(self.lib)
         mode = f"cold budget {cold_budget_mb} MB, {io_threads} I/O threads" if cold_budget_mb else "mmap (page cache)"
-        self._say(f"Experts: {N_LAYERS} layers x {N_EXPERTS} [{mode}], {self.threads} compute threads")
+        self._say(f"Experts: {mode}, {self.threads} compute threads")
 
-        self.embd_tensor = self.tensor_map["token_embd.weight"]
+        tm = self.tensor_map
+        self.embd_tensor = tm["token_embd.weight"]
+        self.output_w, self.output_fmt = self._weight(tm["output.weight"])
+        self.output_norm = _dequant(tm["output_norm.weight"])
+        self._mlock(self.output_w)
 
-        t = self.tensor_map["output.weight"]
-        self.output_fmt = int(t.tensor_type)
-        if self.output_fmt in (GGML_Q4_K, GGML_Q6_K):
-            self.output_w = t.data.reshape(-1).view(np.uint8).copy()
-            self.lib.tg_mlock(self.output_w.ctypes.data, ctypes.c_size_t(self.output_w.nbytes))
-        else:
-            self.output_w = _dequant(t)
-        self.output_norm = _dequant(self.tensor_map["output_norm.weight"])
-
-        self.attn_norms, self.ffn_norms, self.routers, self.qk_norms = [], [], [], []
-        for i in range(N_LAYERS):
-            self.attn_norms.append(_dequant(self.tensor_map[f"blk.{i}.attn_norm.weight"]))
-            self.ffn_norms.append(_dequant(self.tensor_map[f"blk.{i}.ffn_norm.weight"]))
-            self.routers.append(np.ascontiguousarray(_dequant(self.tensor_map[f"blk.{i}.ffn_gate_inp.weight"])))
-            self.qk_norms.append((_dequant(self.tensor_map[f"blk.{i}.attn_q_norm.weight"]),
-                                  _dequant(self.tensor_map[f"blk.{i}.attn_k_norm.weight"])))
-
-        self.attn_weights = []
+        self.attn_norms, self.ffn_norms, self.routers, self.router_bias = [], [], [], []
+        self.qk_norms, self.attn, self.attn_bias, self.sinks, self.expert_bias = [], [], [], [], []
         attn_bytes = 0
-        for i in range(N_LAYERS):
-            tq = self.tensor_map[f"blk.{i}.attn_q.weight"]
-            tk = self.tensor_map[f"blk.{i}.attn_k.weight"]
-            tv = self.tensor_map[f"blk.{i}.attn_v.weight"]
-            to = self.tensor_map[f"blk.{i}.attn_output.weight"]
-            w = {
-                "q": tq.data.reshape(-1).view(np.uint8).copy(),
-                "k": tk.data.reshape(-1).view(np.uint8).copy(),
-                "v": gguf_dequantize(tv.data, tv.tensor_type).astype(np.float16).copy(),
-                "o": to.data.reshape(-1).view(np.uint8).copy(),
-            }
-            for v in w.values():
-                self.lib.tg_mlock(v.ctypes.data, ctypes.c_size_t(v.nbytes))
-                attn_bytes += v.nbytes
-            self.attn_weights.append(w)
+        for i in range(S.n_layers):
+            p = f"blk.{i}."
+            self.attn_norms.append(_dequant(tm[p + "attn_norm.weight"]))
+            self.ffn_norms.append(_dequant(tm[p + f"{S.ffn_norm_name}.weight"]))
+            self.routers.append(np.ascontiguousarray(_dequant(tm[p + "ffn_gate_inp.weight"])))
+            self.router_bias.append(_dequant(tm[p + "ffn_gate_inp.bias"]) if S.router_bias else None)
+            self.qk_norms.append((_dequant(tm[p + "attn_q_norm.weight"]),
+                                  _dequant(tm[p + "attn_k_norm.weight"])) if S.qk_norm else (None, None))
+            w = {}
+            for name, key in (("q", "attn_q"), ("k", "attn_k"), ("v", "attn_v"), ("o", "attn_output")):
+                w[name] = self._weight(tm[p + key + ".weight"])
+                self._mlock(w[name][0])
+                attn_bytes += w[name][0].nbytes
+            self.attn.append(w)
+            self.attn_bias.append({name: _dequant(tm[p + key + ".bias"]) if S.attn_bias else None
+                                   for name, key in (("q", "attn_q"), ("k", "attn_k"),
+                                                     ("v", "attn_v"), ("o", "attn_output"))})
+            self.sinks.append(_dequant(tm[p + "attn_sinks.weight"]) if S.attn_sinks else None)
+            if S.expert_bias:
+                self.expert_bias.append({
+                    k: np.ascontiguousarray(_dequant(tm[p + f"ffn_{k}_exps.bias"]).reshape(S.n_experts, -1))
+                    for k in ("gate", "up", "down")})
+            else:
+                self.expert_bias.append(None)
         self._say(f"Attention weights: {attn_bytes / 1024**2:.0f} MB mlock'd; "
                   f"output head {self.output_w.nbytes / 1024**2:.0f} MB")
 
-        self.rope_cos, self.rope_sin = build_rope_cache(kv_max)
+        self.rope_cos, self.rope_sin = S.rope_tables(kv_max)
         self.kv_max = kv_max
         self.kv_len = 0
-        self.kv_k = [np.zeros((N_KV_HEADS, kv_max, HEAD_DIM), np.float32) for _ in range(N_LAYERS)]
-        self.kv_v = [np.zeros((N_KV_HEADS, kv_max, HEAD_DIM), np.float32) for _ in range(N_LAYERS)]
+        self.kv_k = [np.zeros((S.n_kv_heads, kv_max, S.head_dim), np.float32) for _ in range(S.n_layers)]
+        self.kv_v = [np.zeros((S.n_kv_heads, kv_max, S.head_dim), np.float32) for _ in range(S.n_layers)]
 
-        self.router = Router(self.routers, N_EXPERTS_USED)
-        self.lookahead = LookaheadPredictor(self.routers, self.ffn_norms, RMS_EPS)
+        biases = self.router_bias if S.router_bias else None
+        self.router = Router(self.routers, S.n_experts_used, biases)
+        self.lookahead = LookaheadPredictor(self.routers, self.ffn_norms, S.rms_eps, biases)
         self.routing = RoutingConfig()
         self.lookahead_depth = 0
         self.lookahead_extra = 0
         self.token_prior = None
-        self.token_prior_n = N_EXPERTS_USED
+        self.token_prior_n = S.n_experts_used
         self.draft_prefetch = True
         self.trace = None
+        self.act = ACT_CODES[S.activation]
         self.reset_timers()
 
         self._say(f"Engine ready in {time.perf_counter() - t_start:.1f}s")
@@ -137,6 +138,16 @@ class NWSEngine:
     def _say(self, msg):
         if self.verbose:
             print(msg, flush=True)
+
+    def _weight(self, t):
+        """Raw quantized bytes + format code, or an f16 copy for unsupported types."""
+        code = FMT_CODES.get(int(t.tensor_type))
+        if code is not None and code != 1:
+            return t.data.reshape(-1).view(np.uint8).copy(), code
+        return gguf_dequantize(t.data, t.tensor_type).astype(np.float16).copy(), 1
+
+    def _mlock(self, arr):
+        self.lib.tg_mlock(arr.ctypes.data, ctypes.c_size_t(arr.nbytes))
 
     def close(self):
         self.expert_cache.close()
@@ -187,8 +198,8 @@ class NWSEngine:
             self._say(f"  {time.perf_counter() - t0:.1f}s")
         t0 = time.perf_counter()
         if pins_per_layer is None:
-            pins_per_layer = {l: n_per_layer for l in range(N_LAYERS)}
-        count = self.expert_cache.pin_nonuniform(pins_per_layer, N_LAYERS)
+            pins_per_layer = {l: n_per_layer for l in range(self.spec.n_layers)}
+        count = self.expert_cache.pin_nonuniform(pins_per_layer, self.spec.n_layers)
         gb = self.expert_cache.pinned_bytes() / 1024**3
         self._say(f"Pinned {count} experts ({gb:.2f} GB) in {time.perf_counter() - t0:.1f}s")
         self.reset_timers()
@@ -207,19 +218,23 @@ class NWSEngine:
 
     def _prefetch_token_prior(self, token_ids):
         ec = self.expert_cache
-        for l in range(N_LAYERS):
+        for l in range(self.spec.n_layers):
             cand = set()
             for tok in token_ids:
                 cand.update(int(e) for e in self.token_prior.predict(l, tok, self.token_prior_n))
             if cand:
                 ec.prefetch_many(l, sorted(cand), PRIO_TOKEN_PRIOR + l)
 
+    @staticmethod
+    def _ptr(arr):
+        return arr.ctypes.data if arr is not None else None
+
     def forward_rows(self, token_ids, start_pos, mode="exact"):
         """Runs k tokens at positions start_pos..start_pos+k-1 through the model.
         Returns logits [k, vocab]. KV entries for those positions are (re)written."""
-        lib, ec = self.lib, self.expert_cache
+        lib, ec, S = self.lib, self.expert_cache, self.spec
         k = len(token_ids)
-        D = EMBED_DIM
+        D, L, K = S.embed_dim, S.n_layers, S.n_experts_used
         X = np.ascontiguousarray(np.stack([self.embed(t) for t in token_ids]), dtype=np.float32)
         normed = np.empty(D, np.float32)
         attn_out = np.empty(D, np.float32)
@@ -228,9 +243,10 @@ class NWSEngine:
         draft = mode == "draft"
         tr = self.trace if (self.trace is not None and k == 1 and not draft) else None
         need_resident = draft or self.routing.bias != 0.0 or tr is not None
+        eps = ctypes.c_float(S.rms_eps)
 
         ec.new_token()
-        requested = np.zeros((N_LAYERS, N_EXPERTS), bool)
+        requested = np.zeros((L, S.n_experts), bool)
         if self.token_prior is not None and not draft:
             t0 = time.perf_counter()
             self._prefetch_token_prior(token_ids)
@@ -238,48 +254,51 @@ class NWSEngine:
         if tr:
             tr.begin_token(token_ids[0], start_pos)
 
-        for i in range(N_LAYERS):
+        for i in range(L):
             t0 = time.perf_counter()
             ec.begin_layer(i)
-            aw = self.attn_weights[i]
+            w, b = self.attn[i], self.attn_bias[i]
             q_norm_w, k_norm_w = self.qk_norms[i]
+            window = S.sliding_window if S.is_swa_layer(i) else 0
             for r in range(k):
                 x = X[r]
                 pos = start_pos + r
                 lib.tg_rms_norm(x.ctypes.data, self.attn_norms[i].ctypes.data,
-                                normed.ctypes.data, D, ctypes.c_float(RMS_EPS))
-                lib.tg_attention_decode_q4(
-                    aw["q"].ctypes.data, aw["k"].ctypes.data, aw["v"].ctypes.data, aw["o"].ctypes.data,
-                    q_norm_w.ctypes.data, k_norm_w.ctypes.data,
-                    self.kv_k[i].ctypes.data, self.kv_v[i].ctypes.data, pos, self.kv_max,
+                                normed.ctypes.data, D, eps)
+                lib.tg_attention_v2(
+                    w["q"][1], w["k"][1], w["v"][1], w["o"][1],
+                    w["q"][0].ctypes.data, w["k"][0].ctypes.data, w["v"][0].ctypes.data, w["o"][0].ctypes.data,
+                    self._ptr(b["q"]), self._ptr(b["k"]), self._ptr(b["v"]), self._ptr(b["o"]),
+                    self._ptr(q_norm_w), self._ptr(k_norm_w), self._ptr(self.sinks[i]),
+                    self.kv_k[i].ctypes.data, self.kv_v[i].ctypes.data, pos, self.kv_max, window,
                     self.rope_cos.ctypes.data, self.rope_sin.ctypes.data,
                     normed.ctypes.data, attn_out.ctypes.data,
-                    D, N_HEADS, N_KV_HEADS, HEAD_DIM, pos)
+                    D, S.n_heads, S.n_kv_heads, S.head_dim, pos, eps)
                 x += attn_out
             t1 = time.perf_counter()
             tm["attn"] += t1 - t0
 
-            rr = np.sqrt(np.mean(X * X, axis=1, keepdims=True) + RMS_EPS)
+            rr = np.sqrt(np.mean(X * X, axis=1, keepdims=True) + S.rms_eps)
             N = np.ascontiguousarray((X / rr) * self.ffn_norms[i], dtype=np.float32)
             resident = ec.resident_mask(i) if need_resident else None
             union = {}
             for r in range(k):
                 logits = self.router.logits(i, N[r])
-                idx, w = self.router.select(logits, resident, self.routing, restrict=draft)
+                idx, wts = self.router.select(logits, resident, self.routing, restrict=draft)
                 if draft and self.draft_prefetch:
                     for e in self.router._topk(logits):
                         if not resident[e]:
                             ec.prefetch(i, int(e), PRIO_DRAFT)
                 if tr:
                     tr.record_layer(i, logits, idx, resident, X[0])
-                for e, wt in zip(idx, w):
+                for e, wt in zip(idx, wts):
                     union.setdefault(int(e), {})[r] = float(wt)
             t2 = time.perf_counter()
             tm["route"] += t2 - t1
 
-            if self.lookahead_depth and not draft and i + 1 < N_LAYERS:
-                l0, l1 = i + 1, min(N_LAYERS, i + 1 + self.lookahead_depth)
-                cand = self.lookahead.candidates(l0, l1, X, N_EXPERTS_USED + self.lookahead_extra)
+            if self.lookahead_depth and not draft and i + 1 < L:
+                l0, l1 = i + 1, min(L, i + 1 + self.lookahead_depth)
+                cand = self.lookahead.candidates(l0, l1, X, K + self.lookahead_extra)
                 ec.retarget(l0, set(np.flatnonzero(cand[0]).tolist()))
                 new = cand & ~ec.resident_masks(l0, l1) & ~requested[l0:l1]
                 requested[l0:l1] |= new
@@ -304,12 +323,21 @@ class NWSEngine:
             gate_ptrs = (ctypes.c_void_p * n)(*[v["gate"].ctypes.data for v in views])
             up_ptrs = (ctypes.c_void_p * n)(*[v["up"].ctypes.data for v in views])
             down_ptrs = (ctypes.c_void_p * n)(*[v["down"].ctypes.data for v in views])
-            fmts = (ctypes.c_int * n)(*[_down_fmt(v) for v in views])
+            fmts = (ctypes.c_int * n)(*[FMT_NAMES[v["_formats"].get("down", "q4_k")] for v in views])
+            gate_fmt = FMT_NAMES[views[0]["_formats"].get("gate", "q4_k")]
+            eb = self.expert_bias[i]
+            if eb is not None:
+                bptr = {key: (ctypes.c_void_p * n)(*[eb[key].ctypes.data + e * eb[key].strides[0] for e in experts])
+                        for key in ("gate", "up", "down")}
+                gb, ub, db = ctypes.addressof(bptr["gate"]), ctypes.addressof(bptr["up"]), ctypes.addressof(bptr["down"])
+            else:
+                gb = ub = db = None
             moe_out.fill(0)
-            lib.tg_moe_forward_rows(ctypes.addressof(gate_ptrs), ctypes.addressof(up_ptrs),
-                                    ctypes.addressof(down_ptrs), ctypes.addressof(fmts), n,
-                                    row_w.ctypes.data, N.ctypes.data, moe_out.ctypes.data, k,
-                                    D, EXPERT_INTERMEDIATE)
+            lib.tg_moe_forward_rows_v2(ctypes.addressof(gate_ptrs), ctypes.addressof(up_ptrs),
+                                       ctypes.addressof(down_ptrs), gate_fmt, ctypes.addressof(fmts),
+                                       gb, ub, db, self.act, n,
+                                       row_w.ctypes.data, N.ctypes.data, moe_out.ctypes.data, k,
+                                       D, S.expert_inter)
             X += moe_out
             tm["moe"] += time.perf_counter() - t4
 
@@ -317,19 +345,12 @@ class NWSEngine:
             tr.end_token()
 
         t0 = time.perf_counter()
-        logits = np.empty((k, VOCAB_SIZE), np.float32)
+        logits = np.empty((k, S.vocab_size), np.float32)
         out = np.empty(D, np.float32)
         for r in range(k):
-            lib.tg_rms_norm(X[r].ctypes.data, self.output_norm.ctypes.data,
-                            out.ctypes.data, D, ctypes.c_float(RMS_EPS))
-            if self.output_fmt == GGML_Q6_K:
-                lib.tg_matmul_q6k(self.output_w.ctypes.data, out.ctypes.data,
-                                  logits[r].ctypes.data, VOCAB_SIZE, D)
-            elif self.output_fmt == GGML_Q4_K:
-                lib.tg_matmul_q4k(self.output_w.ctypes.data, out.ctypes.data,
-                                  logits[r].ctypes.data, VOCAB_SIZE, D)
-            else:
-                logits[r] = self.output_w @ out
+            lib.tg_rms_norm(X[r].ctypes.data, self.output_norm.ctypes.data, out.ctypes.data, D, eps)
+            lib.tg_matmul(self.output_fmt, self.output_w.ctypes.data, None, out.ctypes.data,
+                          logits[r].ctypes.data, S.vocab_size, D)
         tm["head"] += time.perf_counter() - t0
 
         self.kv_len = start_pos + k
@@ -379,8 +400,3 @@ class NWSEngine:
         self.last_run = dict(prefill_s=t_prefill, decode_s=t_decode, n_generated=len(generated),
                              **spec_stats.as_dict())
         return generated
-
-
-def _down_fmt(views):
-    fmt = views.get("_formats", {}).get("down", "q4_k")
-    return 1 if fmt == "float16" else 2 if fmt == "q6_k" else 0
