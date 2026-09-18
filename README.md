@@ -235,7 +235,18 @@ tinygiant/
 - [ ] Multi-platform testing (Linux, Windows, different SSDs)
 - [ ] llama.cpp integration (CPU offload path with fused Q4×Q8)
 
-## Prefetch study (2026-09, M5 Max)
+## gpt-oss-120b on a 36 GB Mac (2026-09)
+
+The full write-up — engine design, the four techniques, methodology and results — is in
+[docs/study-100b-on-a-mac.md](docs/study-100b-on-a-mac.md). Headline numbers on an M5 Max, greedy decode:
+
+| gpt-oss-120b (61 GB of experts) | 36 GB Mac (32 experts/layer pinned) | 16 GB Mac emulated (12/layer) |
+|---|---:|---:|
+| baseline | 9.1 tok/s | 10.5 tok/s |
+| exact routing + lookahead prefetch | 11.5 | 12.5 |
+| cache-aware bias β=0.5 (~1% perplexity) | **16.9** | **15.4** (with lookahead 2) |
+
+## Prefetch study on Qwen3-30B (2026-09, M5 Max)
 
 Emulating a 100B model's pin budget on Qwen3-30B (16 of 128 experts pinned per layer ≈ a 16 GB Mac; 56 ≈ a 36 GB Mac),
 measured with the scanner-corrected metric in [docs/prefetch-study.md](docs/prefetch-study.md):
@@ -246,6 +257,9 @@ measured with the scanner-corrected metric in [docs/prefetch-study.md](docs/pref
 | + lookahead prefetch (J=2, +2 candidates) | 19.6 | 25.4 |
 | + cache-aware bias β=0.5 (no measurable ppl loss) | 15.0 | 28.1 |
 | both | **20.8** | 26.9 |
+
+Caveat: the 16 GB-regime rows were partly served from the page cache (see the study); with the cache evicted
+the same regime measures 10.8 → 12.4 tok/s (base → both) at a real ~7.7 GB/s from the SSD.
 
 Self-speculative decoding (draft with resident experts, verify as a batch) reaches 86-89% acceptance at 44% pinned but costs
 more draft compute than the I/O it hides; a token-id prior prefetch is too inaccurate to pay for its bandwidth. Both are

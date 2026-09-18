@@ -124,7 +124,22 @@ r16 repetitions, hence the value of the fair column). Lookahead prediction is ve
 | la2x2 + bias 1.0 | 21.2 | 10.5 + 5.4 | 1087 | 27.1 | 0.4 + 4.5 | 50 |
 
 Compute threads (r36 base, same conditions): 6 threads 27.0 ms compute, 12 threads 21.9 ms,
-18 threads 25.1 ms. The engine now defaults to all non-efficiency cores (12 on this M5 Max).
+18 threads 25.1 ms. The engine now defaults to the largest non-efficiency core cluster (12 on this M5 Max).
+
+**Page-cache caveat (found later).** `F_NOCACHE` prevents new caching but does not evict pages
+that are already cached, and the 16 GB expert cache had been written shortly before these runs, so
+part of the "cold" traffic above was served from RAM (implied read rates of 10-23 GB/s exceed
+the SSD). Re-measured after evicting the page cache (`benchmarks/evict_cache.py`), the r16
+regime reads at a realistic ~7.7 GB/s:
+
+| config (evicted, r16) | tok/s | wait ms | MB/tok |
+|---|---:|---:|---:|
+| base | 10.8 | 67 | 715 |
+| la2x2 + bias 0.5 | 12.4 | 53 | 982 |
+
+The gain shrinks from +42% to +15%: when the SSD really is the limit, lookahead's extra reads
+cost real bandwidth. The r36 regime (26 cold reads per token) is far less affected. All
+gpt-oss-120b numbers below are taken with the cache evicted before every run.
 
 Recommended defaults: lookahead J=2 with 2 extra candidates plus beta=0.5 when less than ~25% of
 experts are pinned; beta=0.5 alone (lookahead off) when more than ~40% are pinned.
